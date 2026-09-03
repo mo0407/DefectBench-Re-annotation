@@ -144,15 +144,43 @@ gunicorn --workers 1 --bind 0.0.0.0:5010 reannotation_app:app
 
 在网页中使用 **本地路径导入** 时，填写 Linux 数据集路径，例如 `/home/ubuntu/datasets/defect_batch`。结果会写入该数据集的 `annotation_output/`。如使用 **导入文件夹**，上传批次会保存至 `ANNOTATION_STORAGE_ROOT` 指定目录下的 `imported_datasets/`。
 
-## Render 在线部署
+## 在线部署：Render + Cloudflare R2（保留 31 天）
 
-本仓库包含 `render.yaml`。在 Render 中从 GitHub 新建 Web Service 并选择该仓库；配置会使用 `/var/data` 挂载的持久化磁盘，上传批次、专家结果与导出数据都会保存在该磁盘中，而不是 Git 仓库中。
+GitHub Pages 只能托管静态页面，不能运行本工具的 Flask API、处理上传或保存标注。要将链接提供给其他人使用，推荐使用 **Render 免费 Web Service + Cloudflare R2 对象存储**：Render 运行网页和 API；R2 保存导入的图片、专家修改、决策轨迹及最终导出结果。
 
-GitHub Pages 只能托管静态页面，不能运行本工具的 Flask API、处理上传或保存标注。
+### 1. 创建 R2 存储桶
+
+1. 登录 Cloudflare，打开 **R2**，创建私有 bucket，例如 `defectbench-reannotation`。
+2. 在 R2 的 **Manage R2 API Tokens** 创建一个有该 bucket `Object Read & Write` 权限的 API token，保存 Access Key ID 和 Secret Access Key。
+3. 复制该账号的 S3 API endpoint，格式类似 `https://<account-id>.r2.cloudflarestorage.com`。
+4. 在 bucket 的 **Lifecycle rules** 新建规则：前缀填 `defectbench/datasets/`，对象创建 **31 天后删除**。这会同时清理该批次的原始上传、专家结果、版本轨迹和导出文件。
+
+### 2. 创建 Render 服务
+
+1. 在 Render 选择 **New → Web Service**，连接本 GitHub 仓库。
+2. Render 会识别 `render.yaml`；选择 **Free** 计划并创建服务。
+3. 在服务的 Environment 页面新增下列环境变量（不要将密钥提交到 GitHub）：
+
+```text
+R2_BUCKET=defectbench-reannotation
+R2_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=<R2 Access Key ID>
+R2_SECRET_ACCESS_KEY=<R2 Secret Access Key>
+R2_PREFIX=defectbench
+R2_RETENTION_DAYS=31
+```
+
+4. 点击 **Manual Deploy → Deploy latest commit**。部署成功后，Render 会提供一个 `https://...onrender.com` 链接，可直接发送给其他使用者。
+
+在线模式下请使用 **导入文件夹** 上传数据集；“本地路径导入”只适用于本机运行，线上服务无法访问访问者电脑的磁盘路径。免费 Render 服务闲置后会休眠，首次重新访问可能需要等待启动；由于数据已同步至 R2，重启不会丢失已完成的标注。
+
+### 云端数据结构
+
+R2 中的对象以 `defectbench/datasets/<导入批次 ID>/` 存放。每次保存会立即同步专家标签、Mask、版本快照与 `decision_events.jsonl`；导出最终数据集时，也会同步 `final_exports/`。当前版本是“单个活动批次”模式：新导入的批次会成为网页当前批次，服务重启后会自动恢复最近一次导入的批次。
 
 ### 图片容量说明
 
-代码仓库不保存图片、Mask 或导出数据。小批量数据可经网页文件夹导入并存入持久化磁盘。对于大批量或高分辨率图片，应使用 S3、OSS 或 MinIO 等对象存储，并改为直接上传到对象存储；不要将大量图片提交到 GitHub，也不要依赖临时云磁盘。
+代码仓库不保存图片、Mask 或导出数据。在线版默认将它们上传到 R2；R2 标准存储每月含 10 GB 免费额度。若单批或一个月内总量超过该额度，应先估算对象存储费用，或缩小批次并及时导出、删除。不要将大量图片提交到 GitHub，也不要依赖 Render 的临时本地磁盘。
 
 ## 数据安全
 
