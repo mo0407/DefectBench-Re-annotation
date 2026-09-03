@@ -2,12 +2,9 @@ services:
   - type: web
     name: defectbench-reannotation
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT reannotation_app:app
-    disk:
-      name: annotation-data
-      mountPath: /var/data
-      sizeGB: 10
     envVars:
       - key: ANNOTATION_STORAGE_ROOT
-        value: /var/data
+        value: /tmp/annotation_storage
