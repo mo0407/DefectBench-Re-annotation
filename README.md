@@ -178,6 +178,32 @@ R2_RETENTION_DAYS=31
 
 R2 中的对象以 `defectbench/datasets/<导入批次 ID>/` 存放。每次保存会立即同步专家标签、Mask、版本快照与 `decision_events.jsonl`；导出最终数据集时，也会同步 `final_exports/`。当前版本是“单个活动批次”模式：新导入的批次会成为网页当前批次，服务重启后会自动恢复最近一次导入的批次。
 
+## 阿里云部署：ECS/轻量应用服务器 + OSS
+
+面向中国大陆用户时，建议将服务器和 OSS Bucket 放在同一地域（如杭州、上海或北京），服务器通过 OSS 内网 Endpoint 访问 Bucket。这样应用与 OSS 之间不产生公网流量费用，且访问延迟更低。
+
+1. 创建私有 OSS Bucket，并在 **数据管理 → 生命周期** 为 `defectbench/datasets/` 设置“最后修改后 31 天删除”。
+2. 创建仅授予该 Bucket 读写权限的 RAM 用户或 RAM 角色；不要使用主账号 AccessKey。
+3. 购买同地域 ECS 或轻量应用服务器，推荐 Ubuntu 22.04 与 Python 3.11；将本仓库上传或从 GitHub 克隆到服务器。
+4. 在服务器配置环境变量后，使用 Dockerfile 或 Gunicorn 启动：
+
+```text
+OSS_BUCKET=<bucket-name>
+OSS_ENDPOINT=https://oss-<region-id>-internal.aliyuncs.com
+OSS_ACCESS_KEY_ID=<RAM AccessKey ID>
+OSS_ACCESS_KEY_SECRET=<RAM AccessKey Secret>
+OSS_PREFIX=defectbench
+R2_RETENTION_DAYS=31
+```
+
+```bash
+docker build -t defectbench-reannotation .
+docker run -d --restart unless-stopped -p 80:8000 \
+  --env-file .env defectbench-reannotation
+```
+
+配置 `OSS_BUCKET` 后，程序优先使用阿里云 OSS；未配置时仍可兼容原 R2 配置。注意：OSS 的 Python SDK 与 R2 的 boto3 接口不同，不能只替换 Endpoint。中国大陆服务器使用自定义域名对外提供网站时，应按当地要求完成备案。
+
 ### 图片容量说明
 
 代码仓库不保存图片、Mask 或导出数据。在线版默认将它们上传到 R2；R2 标准存储每月含 10 GB 免费额度。若单批或一个月内总量超过该额度，应先估算对象存储费用，或缩小批次并及时导出、删除。不要将大量图片提交到 GitHub，也不要依赖 Render 的临时本地磁盘。

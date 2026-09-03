@@ -46,6 +46,11 @@ try:
 except ImportError:
     boto3 = None
 
+try:
+    import oss2
+except ImportError:
+    oss2 = None
+
 # Import SAM service and Detection Agent
 # Import from local defect_bench modules
 try:
@@ -190,7 +195,75 @@ class R2Storage:
         return downloaded
 
 
-R2 = R2Storage()
+class OSSStorage:
+    """Alibaba Cloud OSS adapter with the same interface as the legacy R2 adapter."""
+
+    def __init__(self) -> None:
+        self.bucket_name = os.environ.get("OSS_BUCKET", "").strip()
+        self.prefix = os.environ.get("OSS_PREFIX", "defectbench").strip("/")
+        self.client = None
+        self._lock = threading.Lock()
+        if not self.bucket_name:
+            return
+        endpoint = os.environ.get("OSS_ENDPOINT", "").strip()
+        access_key = os.environ.get("OSS_ACCESS_KEY_ID", "").strip()
+        secret_key = os.environ.get("OSS_ACCESS_KEY_SECRET", "").strip()
+        if not (oss2 and endpoint and access_key and secret_key):
+            raise RuntimeError(
+                "OSS_BUCKET 已设置，但缺少 oss2 或 OSS_ENDPOINT、OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET。"
+            )
+        self.client = oss2.Bucket(oss2.Auth(access_key, secret_key), endpoint, self.bucket_name)
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None
+
+    def key(self, relative: str) -> str:
+        clean = relative.replace("\\", "/").lstrip("/")
+        return f"{self.prefix}/{clean}" if self.prefix else clean
+
+    def put_file(self, local_path: Path, relative: str) -> None:
+        if self.enabled:
+            self.client.put_object_from_file(self.key(relative), str(local_path))
+
+    def put_bytes(self, payload: bytes, relative: str, *, content_type: str = "application/json") -> None:
+        if self.enabled:
+            self.client.put_object(self.key(relative), payload, headers={"Content-Type": content_type})
+
+    def get_bytes(self, relative: str) -> Optional[bytes]:
+        if not self.enabled:
+            return None
+        try:
+            return self.client.get_object(self.key(relative)).read()
+        except oss2.exceptions.NoSuchKey:
+            return None
+
+    def put_tree(self, local_root: Path, remote_root: str) -> None:
+        if not self.enabled:
+            return
+        for path in local_root.rglob("*"):
+            if path.is_file():
+                self.put_file(path, f"{remote_root.rstrip('/')}/{path.relative_to(local_root).as_posix()}")
+
+    def get_tree(self, remote_root: str, local_root: Path) -> int:
+        if not self.enabled:
+            return 0
+        prefix = self.key(remote_root.rstrip("/") + "/")
+        downloaded = 0
+        for item in oss2.ObjectIterator(self.client, prefix=prefix):
+            relative = item.key[len(prefix):]
+            if not relative or relative.endswith("/"):
+                continue
+            target = local_root / PurePosixPath(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self.client.get_object_to_file(item.key, str(target))
+            downloaded += 1
+        return downloaded
+
+
+# OSS takes precedence for Alibaba Cloud deployments.  The R2 fallback keeps
+# the already deployed Render service usable until the OSS migration is live.
+R2 = OSSStorage() if os.environ.get("OSS_BUCKET", "").strip() else R2Storage()
 ACTIVE_DATASET_DESCRIPTOR = "app_state/active_dataset.json"
 _active_dataset_remote_root: Optional[str] = None
 _active_dataset_local_import_root: Optional[Path] = None
