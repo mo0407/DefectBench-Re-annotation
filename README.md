@@ -35,6 +35,25 @@ metadata/sample_metadata.json
 
 `unet/`、`sam3/` 和说明文档不是当前网页的必需输入。
 
+## 类别体系与 YOLO 映射
+
+本工具的最终标注体系不是只有 4 类，而是由 **4 个主类和 10 个小类**组成。导入 YOLO 检测框时，程序会按下表将 12 个模型类别自动转换为可编辑、可保存的“主类 / 小类”组合；网页右侧的类别下拉框显示的也是这一最终标注体系。
+
+| YOLO 检测类（12） | 程序内映射（主类 / 小类） |
+| --- | --- |
+| `Concrete_Crack`、`Tile_Crack` | `Crack` / `Linear crack` |
+| `Craquelure` | `Crack` / `Map cracking` |
+| `Concrete_Spalling`、`Tile_spalling` | `Material_loss` / `Spalling` |
+| `Concrete_Delamination`、`Bulging`、`Degraded_Plaster` | `Material_loss` / `Peeling` |
+| `Rust_Stain` | `Stain` / `Rust stain` |
+| `Water_Stain` | `Stain` / `Leakage stain` |
+| `Vegeterian` | `External Fixings` / `Vegetation growth` |
+| `Contaminants` | `External Fixings` / `Surface contaminants` |
+
+`Corrosion`（腐蚀）和 `Graffiti`（涂鸦）是最终标注体系中允许专家手工选择的小类，但当前 YOLO 的 12 类检测结果不会自动生成这两类。专家可以在工具中新增或修改检测框后选择它们。
+
+所有保存的检测框都会校验主类与小类的合法组合，以保证导出结果与数据集标注规范一致。当前程序会保留并支持 `Linear crack`、`Map cracking`、`Spalling`、`Peeling` 等细分类；如后续确认最终规范无需区分某些小类，应同步调整程序中的类别体系、YOLO 映射和相关色彩配置。
+
 ## 操作流程
 
 1. 点击 **导入文件夹**，选择数据集根目录；在线模式会复制到服务器的持久化数据目录。
@@ -83,6 +102,47 @@ python reannotation_app.py
 ```text
 <dataset>/annotation_output/
 ```
+
+## Linux 启动方式
+
+以下示例适用于 Ubuntu / Debian。应用本身不依赖 Windows 路径；在 Linux 中请使用 `/home/...` 等绝对路径。
+
+```bash
+# 1. 安装 Python 与 Git（首次运行时需要）
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip git
+
+# 2. 下载代码并安装依赖
+git clone https://github.com/mo0407/DefectBench-Re-annotation.git
+cd DefectBench-Re-annotation
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 3. 可选：指定启动时默认读取的数据集
+export DEFECT_BENCH_OPEN_DATASET_ROOT=/home/ubuntu/datasets/defect_batch
+export REANNOTATION_PORT=5010
+
+# 4. 启动
+python reannotation_app.py
+```
+
+浏览器访问 `http://<服务器IP>:5010/`。如服务器启用了防火墙，还需开放端口：
+
+```bash
+sudo ufw allow 5010/tcp
+```
+
+生产环境建议使用 Gunicorn，而不是 Flask 内置开发服务：
+
+```bash
+source .venv/bin/activate
+export DEFECT_BENCH_OPEN_DATASET_ROOT=/home/ubuntu/datasets/defect_batch
+gunicorn --workers 1 --bind 0.0.0.0:5010 reannotation_app:app
+```
+
+在网页中使用 **本地路径导入** 时，填写 Linux 数据集路径，例如 `/home/ubuntu/datasets/defect_batch`。结果会写入该数据集的 `annotation_output/`。如使用 **导入文件夹**，上传批次会保存至 `ANNOTATION_STORAGE_ROOT` 指定目录下的 `imported_datasets/`。
 
 ## Render 在线部署
 
