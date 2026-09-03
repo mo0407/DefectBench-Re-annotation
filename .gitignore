@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+
+# JavaScript dependencies and generated bundles
+frontend/node_modules/
+frontend/dist/
+
+# Local datasets, uploaded batches, expert results, and generated exports
+test/
+imported_datasets/
+annotation_output/
+final_exports/
+expert_labels/
+expert_masks/
+revisions/
+decision_events.jsonl
+
+# Credentials and local editor files
+.env
+.env.*
+.vscode/
+.idea/
