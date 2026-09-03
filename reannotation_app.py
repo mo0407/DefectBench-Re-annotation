@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 import sys
 import uuid
+import threading
 from pathlib import Path, PurePosixPath
 
 # defect_bench path resolution
@@ -39,6 +40,11 @@ from datetime import datetime, timezone
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
 from PIL import Image, ImageDraw
+
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 
 # Import SAM service and Detection Agent
 # Import from local defect_bench modules
@@ -97,6 +103,99 @@ FINAL_EXPORTS_DIR = OUTPUT_ROOT / "final_exports"
 STORAGE_ROOT = Path(os.environ.get("ANNOTATION_STORAGE_ROOT", str(_THIS_FILE.parent))).resolve()
 IMPORT_ROOT = STORAGE_ROOT / "imported_datasets"
 
+
+class R2Storage:
+    """Small S3-compatible persistence layer used by the cloud deployment.
+
+    The application always works against a local working directory.  When R2
+    is configured, imported batches and expert outputs are mirrored to R2 so a
+    free/ephemeral web service can restart without losing annotation data.
+    """
+
+    def __init__(self) -> None:
+        self.bucket = os.environ.get("R2_BUCKET", "").strip()
+        self.prefix = os.environ.get("R2_PREFIX", "defectbench").strip("/")
+        self.client = None
+        self._lock = threading.Lock()
+        if not self.bucket:
+            return
+        endpoint = os.environ.get("R2_ENDPOINT_URL", "").strip()
+        access_key = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+        secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+        if not (boto3 and endpoint and access_key and secret_key):
+            raise RuntimeError(
+                "R2_BUCKET 已设置，但缺少 boto3 或 R2_ENDPOINT_URL、R2_ACCESS_KEY_ID、R2_SECRET_ACCESS_KEY。"
+            )
+        self.client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto",
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None
+
+    def key(self, relative: str) -> str:
+        clean = relative.replace("\\", "/").lstrip("/")
+        return f"{self.prefix}/{clean}" if self.prefix else clean
+
+    def put_file(self, local_path: Path, relative: str) -> None:
+        if self.enabled:
+            self.client.upload_file(str(local_path), self.bucket, self.key(relative))
+
+    def put_bytes(self, payload: bytes, relative: str, *, content_type: str = "application/json") -> None:
+        if self.enabled:
+            self.client.put_object(Bucket=self.bucket, Key=self.key(relative), Body=payload, ContentType=content_type)
+
+    def get_bytes(self, relative: str) -> Optional[bytes]:
+        if not self.enabled:
+            return None
+        try:
+            return self.client.get_object(Bucket=self.bucket, Key=self.key(relative))["Body"].read()
+        except self.client.exceptions.NoSuchKey:
+            return None
+        except Exception as error:
+            # R2 may surface a missing object as a generic ClientError.
+            if getattr(error, "response", {}).get("Error", {}).get("Code") in {"NoSuchKey", "404", "NoSuchBucket"}:
+                return None
+            raise
+
+    def put_tree(self, local_root: Path, remote_root: str) -> None:
+        if not self.enabled:
+            return
+        for path in local_root.rglob("*"):
+            if path.is_file():
+                self.put_file(path, f"{remote_root.rstrip('/')}/{path.relative_to(local_root).as_posix()}")
+
+    def get_tree(self, remote_root: str, local_root: Path) -> int:
+        """Download a complete prefix into the ephemeral local working cache."""
+        if not self.enabled:
+            return 0
+        prefix = self.key(remote_root.rstrip("/") + "/")
+        paginator = self.client.get_paginator("list_objects_v2")
+        downloaded = 0
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for item in page.get("Contents", []):
+                remote_key = item["Key"]
+                relative = remote_key[len(prefix):]
+                if not relative or relative.endswith("/"):
+                    continue
+                target = local_root / PurePosixPath(relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                self.client.download_file(self.bucket, remote_key, str(target))
+                downloaded += 1
+        return downloaded
+
+
+R2 = R2Storage()
+ACTIVE_DATASET_DESCRIPTOR = "app_state/active_dataset.json"
+_active_dataset_remote_root: Optional[str] = None
+_active_dataset_local_import_root: Optional[Path] = None
+_active_dataset_loaded = False
+
 # Class color mapping (RGB)
 CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
     "Crack": (255, 0, 0),             # Red
@@ -153,6 +252,68 @@ def _configure_dataset_root(root: Path, *, output_under_dataset: bool = False) -
     FINAL_EXPORTS_DIR = OUTPUT_ROOT / "final_exports"
     _image_list_cache = []
     _image_list_loaded = False
+
+
+def _remember_remote_dataset(import_root: Path, dataset_root: Path, remote_root: str) -> None:
+    """Persist the active browser-imported batch so a new service instance can reopen it."""
+    global _active_dataset_remote_root, _active_dataset_local_import_root, _active_dataset_loaded
+    if not R2.enabled:
+        return
+    descriptor = {
+        "remote_root": remote_root,
+        "dataset_relative_root": dataset_root.relative_to(import_root).as_posix(),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    R2.put_bytes(json.dumps(descriptor, ensure_ascii=False).encode("utf-8"), ACTIVE_DATASET_DESCRIPTOR)
+    _active_dataset_remote_root = remote_root
+    _active_dataset_local_import_root = import_root
+    _active_dataset_loaded = True
+
+
+def _ensure_active_dataset_loaded() -> None:
+    """Restore the most recently imported cloud batch into the local cache once."""
+    global _active_dataset_remote_root, _active_dataset_local_import_root, _active_dataset_loaded
+    if not R2.enabled or _active_dataset_loaded:
+        return
+    with R2._lock:
+        if _active_dataset_loaded:
+            return
+        descriptor_bytes = R2.get_bytes(ACTIVE_DATASET_DESCRIPTOR)
+        if not descriptor_bytes:
+            _active_dataset_loaded = True
+            return
+        descriptor = json.loads(descriptor_bytes.decode("utf-8"))
+        remote_root = str(descriptor["remote_root"])
+        cache_root = IMPORT_ROOT / "r2_active_dataset"
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        downloaded = R2.get_tree(remote_root, cache_root)
+        relative_root = PurePosixPath(str(descriptor.get("dataset_relative_root") or "."))
+        dataset_root = cache_root.joinpath(*relative_root.parts)
+        if not downloaded or not dataset_root.is_dir():
+            raise RuntimeError("R2 中未找到当前导入的数据集。")
+        _configure_dataset_root(dataset_root)
+        _active_dataset_remote_root = remote_root
+        _active_dataset_local_import_root = cache_root
+        _active_dataset_loaded = True
+        print(f"[R2] Restored active dataset ({downloaded} files) from {remote_root}")
+
+
+def _sync_active_dataset_file(path: Path) -> None:
+    """Upload one changed expert output without re-uploading the original batch."""
+    if R2.enabled and _active_dataset_remote_root:
+        if not _active_dataset_local_import_root:
+            return
+        R2.put_file(path, f"{_active_dataset_remote_root}/{path.relative_to(_active_dataset_local_import_root).as_posix()}")
+
+
+def _sync_active_dataset_tree(directory: Path) -> None:
+    if R2.enabled and _active_dataset_remote_root and _active_dataset_local_import_root:
+        R2.put_tree(
+            directory,
+            f"{_active_dataset_remote_root}/{directory.relative_to(_active_dataset_local_import_root).as_posix()}",
+        )
 
 
 def _mask_path(directory: Path, stem: str) -> Optional[Path]:
@@ -279,6 +440,7 @@ def _image_digest(image_path: Path) -> str:
 def _load_image_list():
     """Load all images from images directory and categorize by naming pattern"""
     global _image_list_cache, _image_list_loaded
+    _ensure_active_dataset_loaded()
     if _image_list_loaded:
         return
     
@@ -454,6 +616,8 @@ def _append_decision_event(
     DECISION_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(DECISION_EVENTS_PATH, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    _sync_active_dataset_file(snapshot_path)
+    _sync_active_dataset_file(DECISION_EVENTS_PATH)
     return revision
 
 
@@ -735,7 +899,7 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                     <button id="importButton" class="import-button" type="button" onclick="document.getElementById('datasetFolderInput').click()">导入文件夹</button>
-                    <button class="import-button" type="button" onclick="openLocalPathDialog()">本地路径导入</button>
+                    <button id="localPathButton" class="import-button" type="button" onclick="openLocalPathDialog()">本地路径导入</button>
                     <button id="exportButton" class="export-button" type="button" onclick="exportFinalDataset()">导出最终数据集</button>
                     <input id="datasetFolderInput" type="file" webkitdirectory directory multiple hidden onchange="importDatasetFolder(event)">
                 </div>
@@ -2174,6 +2338,12 @@ HTML_TEMPLATE = """
         });
         
         // Initialize
+        fetch('/api/runtime').then(response => response.json()).then(runtime => {
+            if (runtime.cloud_storage) {
+                document.getElementById('localPathButton').style.display = 'none';
+                document.getElementById('infoDiv').textContent = 'Cloud mode: upload a dataset folder. Data is persisted to object storage; local computer paths are unavailable.';
+            }
+        }).catch(() => {});
         updateImageList();
     </script>
 </body>
@@ -2184,6 +2354,11 @@ HTML_TEMPLATE = """
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/runtime")
+def api_runtime():
+    return jsonify({"cloud_storage": R2.enabled, "retention_days": int(os.environ.get("R2_RETENTION_DAYS", "31"))})
 
 
 @app.route("/api/images")
@@ -2272,10 +2447,12 @@ def api_export_final_dataset():
             "samples": manifest_samples,
         }
         (export_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        _sync_active_dataset_tree(export_dir)
         return jsonify({
             "success": True,
             "total": len(manifest_samples),
             "folder": str(export_dir.relative_to(BASE_DIR)),
+            "cloud_persisted": R2.enabled,
         })
     except Exception as error:
         import traceback
@@ -2286,6 +2463,8 @@ def api_export_final_dataset():
 @app.route("/api/open_local_dataset", methods=["POST"])
 def api_open_local_dataset():
     """Use an existing local dataset in place and write results below annotation_output/."""
+    if R2.enabled:
+        return jsonify({"success": False, "error": "在线部署无法访问访问者电脑路径，请使用“导入文件夹”。"}), 400
     data = request.get_json(silent=True) or {}
     raw_path = str(data.get("path") or "").strip()
     if not raw_path:
@@ -2354,15 +2533,26 @@ def api_import_dataset():
         if dataset_root is None:
             raise ValueError("未找到 images/、detections/（或 labels/）和 masks/ 子文件夹。")
 
+        # Do not restore the previously active cloud batch while validating a
+        # newly uploaded one.
+        global _active_dataset_loaded, _active_dataset_local_import_root
+        if R2.enabled:
+            _active_dataset_loaded = True
+            _active_dataset_local_import_root = destination
         _configure_dataset_root(dataset_root)
         _load_image_list()
         if not _image_list_cache:
             raise ValueError("images/ 子文件夹中没有可读取的 JPG 或 PNG 图片。")
+        if R2.enabled:
+            remote_root = f"datasets/{import_id}"
+            R2.put_tree(destination, remote_root)
+            _remember_remote_dataset(destination, dataset_root, remote_root)
         return jsonify({
             "success": True,
             "dataset_name": dataset_root.name,
             "total": len(_image_list_cache),
             "imported_files": saved_count,
+            "cloud_persisted": R2.enabled,
         })
     except Exception as error:
         print(f"[Import] Failed: {error}")
@@ -2559,6 +2749,10 @@ def api_save():
         global _image_list_loaded
         _image_list_loaded = False
         _load_image_list()
+
+        _sync_active_dataset_file(label_path)
+        if mask_base64:
+            _sync_active_dataset_file(EXPERT_MASKS_DIR / f"{stem}_mask.png")
         
         revision = _append_decision_event(
             stem=stem,
