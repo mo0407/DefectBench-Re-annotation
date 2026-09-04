@@ -306,6 +306,25 @@ class OSSStorage:
             downloaded += 1
         return downloaded
 
+    def get_file(self, relative: str, local_path: Path) -> bool:
+        """Download one object only, keeping the web instance cache small."""
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            self.client.get_object_to_file(self.key(relative), str(local_path))
+            return True
+        except oss2.exceptions.NoSuchKey:
+            return False
+
+    def copy_file(self, source_relative: str, target_relative: str) -> None:
+        """Copy server-side inside OSS; never write complete exports to Render disk."""
+        self.client.copy_object(self.key(target_relative), self.bucket_name, self.key(source_relative))
+
+    def presign_put(self, relative: str, *, expires_in: int = 3600) -> str:
+        """Short-lived browser PUT URL.  The browser sends images direct to OSS."""
+        if not self.enabled:
+            raise RuntimeError("对象存储尚未配置。")
+        return self.client.sign_url("PUT", self.key(relative), expires_in)
+
 
 # OSS takes precedence for Alibaba Cloud deployments.  The R2 fallback keeps
 # the already deployed Render service usable until the OSS migration is live.
@@ -574,7 +593,7 @@ def _image_digest(image_path: Path) -> str:
 
 def _materialize_sample(stem: str) -> None:
     """Fetch only the requested sample and its small sidecar files into /tmp."""
-    if not (_active_dataset_manifest and isinstance(R2, R2Storage) and _active_dataset_remote_root and _active_dataset_local_import_root):
+    if not (_active_dataset_manifest and R2.enabled and _active_dataset_remote_root and _active_dataset_local_import_root):
         return
     root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
     prefix = root + "/" if root else ""
@@ -2594,7 +2613,7 @@ def api_export_final_dataset():
         export_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_final"
         # A direct import can be several GB.  Create its export with R2-to-R2
         # copies instead of downloading every image into Render's 10GB disk.
-        if _active_dataset_manifest and isinstance(R2, R2Storage) and _active_dataset_remote_root:
+        if _active_dataset_manifest and R2.enabled and _active_dataset_remote_root:
             root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
             prefix = root + "/" if root else ""
             remote_export = f"{_active_dataset_remote_root}/{prefix}final_exports/{export_id}"
@@ -2755,8 +2774,8 @@ def _find_imported_dataset_root(destination: Path) -> Optional[Path]:
 
 @app.route("/api/direct_upload/start", methods=["POST"])
 def api_direct_upload_start():
-    if not isinstance(R2, R2Storage) or not R2.enabled:
-        return jsonify({"success": False, "error": "直传仅在已配置 Cloudflare R2 的在线模式下可用。"}), 400
+    if not R2.enabled:
+        return jsonify({"success": False, "error": "直传需要先配置 OSS 或 Cloudflare R2。"}), 400
     data = request.get_json(silent=True) or {}
     entries = data.get("files")
     if not isinstance(entries, list) or not entries:
@@ -2766,7 +2785,10 @@ def api_direct_upload_start():
         return jsonify({"success": False, "error": f"单次最多支持 {max_files} 个文件。"}), 400
     try:
         import_id = "direct_" + uuid.uuid4().hex
-        R2.ensure_browser_upload_cors()
+        # R2 can configure CORS through its S3 API.  OSS CORS is configured in
+        # the OSS console once, and then uses the same signed-upload protocol.
+        if isinstance(R2, R2Storage):
+            R2.ensure_browser_upload_cors()
         seen = set()
         uploads: List[Dict[str, str]] = []
         for entry in entries:
@@ -2791,8 +2813,8 @@ def api_direct_upload_start():
 
 @app.route("/api/direct_upload/complete", methods=["POST"])
 def api_direct_upload_complete():
-    if not isinstance(R2, R2Storage) or not R2.enabled:
-        return jsonify({"success": False, "error": "直传仅在已配置 Cloudflare R2 的在线模式下可用。"}), 400
+    if not R2.enabled:
+        return jsonify({"success": False, "error": "直传需要先配置 OSS 或 Cloudflare R2。"}), 400
     upload_id = str((request.get_json(silent=True) or {}).get("upload_id") or "")
     suffix = upload_id[len("direct_"):] if upload_id.startswith("direct_") else ""
     if len(suffix) != 32 or not all(ch in "0123456789abcdef" for ch in suffix):

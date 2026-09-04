@@ -172,7 +172,7 @@ R2_RETENTION_DAYS=31
 
 4. 点击 **Manual Deploy → Deploy latest commit**。部署成功后，Render 会提供一个 `https://...onrender.com` 链接，可直接发送给其他使用者。
 
-在线模式下请使用 **导入文件夹** 上传数据集；在 R2 已配置时，网页会先获取仅 1 小时有效的上传链接，再由浏览器把文件**直接传入 R2**，不会将大批量图片经由 Render 中转。“本地路径导入”只适用于本机运行，线上服务无法访问访问者电脑的磁盘路径。免费 Render 服务闲置后会休眠，首次重新访问可能需要等待启动；由于数据已同步至 R2，重启不会丢失已完成的标注。
+在线模式下请使用 **导入文件夹** 上传数据集；配置 R2 或 OSS 后，网页会先获取仅 1 小时有效的上传链接，再由浏览器把文件**直接传入对象存储**，不会将大批量图片经由 Render 中转。“本地路径导入”只适用于本机运行，线上服务无法访问访问者电脑的磁盘路径。免费 Render 服务闲置后会休眠，首次重新访问可能需要等待启动；由于数据已同步至对象存储，重启不会丢失已完成的标注。
 
 ### 云端数据结构
 
@@ -203,6 +203,14 @@ docker run -d --restart unless-stopped -p 80:8000 \
 ```
 
 配置 `OSS_BUCKET` 后，程序优先使用阿里云 OSS；未配置时仍可兼容原 R2 配置。注意：OSS 的 Python SDK 与 R2 的 boto3 接口不同，不能只替换 Endpoint。中国大陆服务器使用自定义域名对外提供网站时，应按当地要求完成备案。
+
+### Render + 阿里云 OSS（大批量上传）
+
+也可以继续使用免费的 Render 网站服务，只把数据放在 OSS。Render 的 Environment 中填写上述 `OSS_*` 变量；此时 **`OSS_ENDPOINT` 必须使用公网 Endpoint**，例如 `https://oss-cn-shanghai.aliyuncs.com`，不能使用 `-internal` Endpoint。
+
+在 OSS Bucket 的 **权限管理 → 跨域设置（CORS）** 新增规则：来源填写你的 Render 网站地址（例如 `https://defectbench-re-annotation.onrender.com`），允许方法选择 `PUT`，允许 Header 填 `Content-Type`（也可填 `*`），暴露 Header 填 `ETag`。Bucket 保持私有即可，不需要开放读写权限。
+
+这样上传时每个文件从用户浏览器直接到 OSS；Render 只签发短时 URL、保存标注 JSON/Mask，并在打开某张图片时按需读取该图片。因此即使批次为 3.8GB，也不会触发 Render 的 30 秒上传请求限制或 10GB 临时磁盘限制。单个对象最大 5GB；如存在单张大于 5GB 的文件，需另行启用 OSS 分片上传。
 
 ### 图片容量说明
 
