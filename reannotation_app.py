@@ -205,6 +205,26 @@ class R2Storage:
             HttpMethod="PUT",
         )
 
+    def ensure_browser_upload_cors(self) -> None:
+        """Allow direct PUT uploads only from the configured annotation site."""
+        if not self.enabled:
+            raise RuntimeError("对象存储尚未配置。")
+        origin = os.environ.get(
+            "DIRECT_UPLOAD_ALLOWED_ORIGIN", "https://defectbench-re-annotation.onrender.com"
+        ).strip()
+        if not origin:
+            raise RuntimeError("DIRECT_UPLOAD_ALLOWED_ORIGIN 不能为空。")
+        self.client.put_bucket_cors(
+            Bucket=self.bucket,
+            CORSConfiguration={"CORSRules": [{
+                "AllowedOrigins": [origin],
+                "AllowedMethods": ["PUT"],
+                "AllowedHeaders": ["Content-Type"],
+                "ExposeHeaders": ["ETag"],
+                "MaxAgeSeconds": 3600,
+            }]},
+        )
+
 
 class OSSStorage:
     """Alibaba Cloud OSS adapter with the same interface as the legacy R2 adapter."""
@@ -2657,6 +2677,7 @@ def api_direct_upload_start():
         return jsonify({"success": False, "error": f"单次最多支持 {max_files} 个文件。"}), 400
     try:
         import_id = "direct_" + uuid.uuid4().hex
+        R2.ensure_browser_upload_cors()
         seen = set()
         uploads: List[Dict[str, str]] = []
         for entry in entries:
