@@ -194,6 +194,17 @@ class R2Storage:
                 downloaded += 1
         return downloaded
 
+    def presign_put(self, relative: str, *, expires_in: int = 3600) -> str:
+        """Create a short-lived browser upload URL without exposing R2 credentials."""
+        if not self.enabled:
+            raise RuntimeError("对象存储尚未配置。")
+        return self.client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket, "Key": self.key(relative)},
+            ExpiresIn=expires_in,
+            HttpMethod="PUT",
+        )
+
 
 class OSSStorage:
     """Alibaba Cloud OSS adapter with the same interface as the legacy R2 adapter."""
@@ -1222,13 +1233,21 @@ HTML_TEMPLATE = """
 
             const importButton = document.getElementById('importButton');
             const originalText = importButton.textContent;
-            const formData = new FormData();
-            for (const file of input.files) formData.append('files', file, file.webkitRelativePath || file.name);
 
             importButton.disabled = true;
             importButton.textContent = '正在导入…';
             try {
-                const response = await fetch('/api/import_dataset', { method: 'POST', body: formData });
+                const runtimeResponse = await fetch('/api/runtime');
+                const runtime = await runtimeResponse.json();
+                const files = Array.from(input.files);
+                let response;
+                if (runtime.cloud_storage) {
+                    response = await importDatasetFolderDirect(files, importButton);
+                } else {
+                    const formData = new FormData();
+                    for (const file of files) formData.append('files', file, file.webkitRelativePath || file.name);
+                    response = await fetch('/api/import_dataset', { method: 'POST', body: formData });
+                }
                 const data = await response.json();
                 if (!response.ok || !data.success) throw new Error(data.error || '导入失败');
 
@@ -1244,6 +1263,46 @@ HTML_TEMPLATE = """
                 importButton.disabled = false;
                 importButton.textContent = originalText;
             }
+        }
+
+        async function importDatasetFolderDirect(files, importButton) {
+            const startResponse = await fetch('/api/direct_upload/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ files: files.map(file => ({
+                    path: file.webkitRelativePath || file.name,
+                    size: file.size
+                })) })
+            });
+            const start = await startResponse.json();
+            if (!startResponse.ok || !start.success) throw new Error(start.error || '无法创建直传任务');
+            if (!Array.isArray(start.uploads) || start.uploads.length !== files.length) {
+                throw new Error('直传任务文件清单不完整');
+            }
+
+            let completed = 0;
+            const updateProgress = () => {
+                importButton.textContent = `正在直传 R2… ${completed}/${files.length}`;
+            };
+            let nextIndex = 0;
+            const uploadWorker = async () => {
+                while (nextIndex < files.length) {
+                    const index = nextIndex++;
+                    const putResponse = await fetch(start.uploads[index].url, {
+                        method: 'PUT', body: files[index]
+                    });
+                    if (!putResponse.ok) throw new Error(`上传失败：${start.uploads[index].path}`);
+                    completed += 1;
+                    updateProgress();
+                }
+            };
+            updateProgress();
+            await Promise.all(Array.from({ length: Math.min(4, files.length) }, uploadWorker));
+            importButton.textContent = '正在校验并载入…';
+            return fetch('/api/direct_upload/complete', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ upload_id: start.upload_id })
+            });
         }
         
         // Initialize
@@ -2561,6 +2620,90 @@ def api_open_local_dataset():
             "output_folder": str(OUTPUT_ROOT),
         })
     except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+def _safe_upload_relative_path(raw_path: Any) -> str:
+    """Validate a browser supplied relative filename before using it as an R2 key."""
+    relative_name = str(raw_path or "").replace("\\", "/")
+    parts = PurePosixPath(relative_name).parts
+    if not relative_name or relative_name.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("导入文件包含无效的路径。")
+    return "/".join(parts)
+
+
+def _find_imported_dataset_root(destination: Path) -> Optional[Path]:
+    candidates = [destination]
+    candidates.extend(path.parent for path in destination.rglob("images") if path.is_dir())
+    return next(
+        (candidate for candidate in sorted(candidates, key=lambda path: (len(path.parts), str(path)))
+         if (candidate / "images").is_dir()
+         and ((candidate / "detections").is_dir() or (candidate / "algorithm_labels").is_dir() or (candidate / "labels").is_dir())
+         and ((candidate / "masks").is_dir() or (candidate / "algorithm_masks").is_dir())),
+        None,
+    )
+
+
+@app.route("/api/direct_upload/start", methods=["POST"])
+def api_direct_upload_start():
+    if not isinstance(R2, R2Storage) or not R2.enabled:
+        return jsonify({"success": False, "error": "直传仅在已配置 Cloudflare R2 的在线模式下可用。"}), 400
+    data = request.get_json(silent=True) or {}
+    entries = data.get("files")
+    if not isinstance(entries, list) or not entries:
+        return jsonify({"success": False, "error": "请选择要上传的文件夹。"}), 400
+    max_files = int(os.environ.get("DIRECT_UPLOAD_MAX_FILES", "20000"))
+    if len(entries) > max_files:
+        return jsonify({"success": False, "error": f"单次最多支持 {max_files} 个文件。"}), 400
+    try:
+        import_id = "direct_" + uuid.uuid4().hex
+        seen = set()
+        uploads: List[Dict[str, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("上传文件信息格式错误。")
+            relative_name = _safe_upload_relative_path(entry.get("path"))
+            if relative_name in seen:
+                raise ValueError(f"存在重复文件路径：{relative_name}")
+            seen.add(relative_name)
+            if int(entry.get("size") or 0) < 0:
+                raise ValueError("文件大小无效。")
+            remote_relative = f"datasets/{import_id}/{relative_name}"
+            uploads.append({"path": relative_name, "url": R2.presign_put(remote_relative)})
+        return jsonify({"success": True, "upload_id": import_id, "uploads": uploads, "expires_in": 3600})
+    except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@app.route("/api/direct_upload/complete", methods=["POST"])
+def api_direct_upload_complete():
+    if not isinstance(R2, R2Storage) or not R2.enabled:
+        return jsonify({"success": False, "error": "直传仅在已配置 Cloudflare R2 的在线模式下可用。"}), 400
+    upload_id = str((request.get_json(silent=True) or {}).get("upload_id") or "")
+    suffix = upload_id[len("direct_"):] if upload_id.startswith("direct_") else ""
+    if len(suffix) != 32 or not all(ch in "0123456789abcdef" for ch in suffix):
+        return jsonify({"success": False, "error": "上传批次标识无效。"}), 400
+    destination = IMPORT_ROOT / f"dataset_{upload_id}"
+    remote_root = f"datasets/{upload_id}"
+    try:
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True, exist_ok=False)
+        downloaded = R2.get_tree(remote_root, destination)
+        dataset_root = _find_imported_dataset_root(destination)
+        if dataset_root is None:
+            raise ValueError("未找到 images/、detections/（或 labels/）和 masks/ 子文件夹。")
+        global _active_dataset_loaded, _active_dataset_local_import_root
+        _active_dataset_loaded = True
+        _active_dataset_local_import_root = destination
+        _configure_dataset_root(dataset_root)
+        _load_image_list()
+        if not _image_list_cache:
+            raise ValueError("images/ 子文件夹中没有可读取的 JPG 或 PNG 图片。")
+        _remember_remote_dataset(destination, dataset_root, remote_root)
+        return jsonify({"success": True, "dataset_name": dataset_root.name, "total": len(_image_list_cache), "imported_files": downloaded, "cloud_persisted": True})
+    except Exception as error:
+        print(f"[Direct import] Failed: {error}")
         return jsonify({"success": False, "error": str(error)}), 400
 
 
