@@ -194,6 +194,21 @@ class R2Storage:
                 downloaded += 1
         return downloaded
 
+    def get_file(self, relative: str, local_path: Path) -> bool:
+        """Download one object only; used by large direct imports."""
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            self.client.download_file(self.bucket, self.key(relative), str(local_path))
+            return True
+        except Exception as error:
+            if getattr(error, "response", {}).get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+                return False
+            raise
+
+    def copy_file(self, source_relative: str, target_relative: str) -> None:
+        """Server-side R2 copy, so export files never occupy Render disk."""
+        self.client.copy_object(Bucket=self.bucket, Key=self.key(target_relative), CopySource={"Bucket": self.bucket, "Key": self.key(source_relative)})
+
     def presign_put(self, relative: str, *, expires_in: int = 3600) -> str:
         """Create a short-lived browser upload URL without exposing R2 credentials."""
         if not self.enabled:
@@ -299,6 +314,7 @@ ACTIVE_DATASET_DESCRIPTOR = "app_state/active_dataset.json"
 _active_dataset_remote_root: Optional[str] = None
 _active_dataset_local_import_root: Optional[Path] = None
 _active_dataset_loaded = False
+_active_dataset_manifest: Optional[Dict[str, Any]] = None
 
 # Class color mapping (RGB)
 CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
@@ -360,13 +376,15 @@ def _configure_dataset_root(root: Path, *, output_under_dataset: bool = False) -
 
 def _remember_remote_dataset(import_root: Path, dataset_root: Path, remote_root: str) -> None:
     """Persist the active browser-imported batch so a new service instance can reopen it."""
-    global _active_dataset_remote_root, _active_dataset_local_import_root, _active_dataset_loaded
+    global _active_dataset_remote_root, _active_dataset_local_import_root, _active_dataset_loaded, _active_dataset_manifest
     if not R2.enabled:
         return
     descriptor = {
         "remote_root": remote_root,
         "dataset_relative_root": dataset_root.relative_to(import_root).as_posix(),
         "saved_at": datetime.now(timezone.utc).isoformat(),
+        "direct_upload": bool(_active_dataset_manifest),
+        "manifest": _active_dataset_manifest,
     }
     R2.put_bytes(json.dumps(descriptor, ensure_ascii=False).encode("utf-8"), ACTIVE_DATASET_DESCRIPTOR)
     _active_dataset_remote_root = remote_root
@@ -376,7 +394,7 @@ def _remember_remote_dataset(import_root: Path, dataset_root: Path, remote_root:
 
 def _ensure_active_dataset_loaded() -> None:
     """Restore the most recently imported cloud batch into the local cache once."""
-    global _active_dataset_remote_root, _active_dataset_local_import_root, _active_dataset_loaded
+    global _active_dataset_remote_root, _active_dataset_local_import_root, _active_dataset_loaded, _active_dataset_manifest
     if not R2.enabled or _active_dataset_loaded:
         return
     with R2._lock:
@@ -388,6 +406,19 @@ def _ensure_active_dataset_loaded() -> None:
             return
         descriptor = json.loads(descriptor_bytes.decode("utf-8"))
         remote_root = str(descriptor["remote_root"])
+        if descriptor.get("direct_upload"):
+            cache_root = IMPORT_ROOT / "r2_active_dataset"
+            relative_root = PurePosixPath(str(descriptor.get("dataset_relative_root") or "."))
+            dataset_root = cache_root.joinpath(*relative_root.parts)
+            for folder in ("images", "labels", "detections", "algorithm_labels", "masks", "algorithm_masks", "metadata", "expert_labels", "expert_masks", "revisions"):
+                (dataset_root / folder).mkdir(parents=True, exist_ok=True)
+            _configure_dataset_root(dataset_root)
+            _active_dataset_remote_root = remote_root
+            _active_dataset_local_import_root = cache_root
+            _active_dataset_manifest = descriptor.get("manifest") or {}
+            _active_dataset_loaded = True
+            print(f"[R2] Restored direct dataset manifest from {remote_root}")
+            return
         cache_root = IMPORT_ROOT / "r2_active_dataset"
         if cache_root.exists():
             shutil.rmtree(cache_root)
@@ -541,6 +572,26 @@ def _image_digest(image_path: Path) -> str:
     return hashlib.sha256(image_path.read_bytes()).hexdigest()
 
 
+def _materialize_sample(stem: str) -> None:
+    """Fetch only the requested sample and its small sidecar files into /tmp."""
+    if not (_active_dataset_manifest and isinstance(R2, R2Storage) and _active_dataset_remote_root and _active_dataset_local_import_root):
+        return
+    root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+    prefix = root + "/" if root else ""
+    sample_key = _sample_key(stem)
+    for name in _active_dataset_manifest.get("files", []):
+        if not any(name.startswith(prefix + folder + "/") for folder in ("images", "labels", "detections", "algorithm_labels", "masks", "algorithm_masks", "metadata")):
+            continue
+        if Path(name).stem.startswith(stem) or Path(name).stem.startswith(sample_key):
+            local = _active_dataset_local_import_root / PurePosixPath(name)
+            if not local.exists():
+                R2.get_file(f"{_active_dataset_remote_root}/{name}", local)
+    for name in (f"{prefix}expert_labels/{stem}.json", f"{prefix}expert_masks/{stem}_mask.png"):
+        local = _active_dataset_local_import_root / PurePosixPath(name)
+        if not local.exists():
+            R2.get_file(f"{_active_dataset_remote_root}/{name}", local)
+
+
 def _load_image_list():
     """Load all images from images directory and categorize by naming pattern"""
     global _image_list_cache, _image_list_loaded
@@ -550,6 +601,18 @@ def _load_image_list():
     
     print("[Cache] Loading image list...")
     _image_list_cache = []
+
+    if _active_dataset_manifest:
+        root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+        prefix = root + "/images/" if root else "images/"
+        for remote_name in sorted(_active_dataset_manifest.get("files", [])):
+            relative = remote_name[len(prefix):] if remote_name.startswith(prefix) else ""
+            if not relative or "/" in relative or Path(relative).suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+            stem = Path(relative).stem
+            _image_list_cache.append({"stem": stem, "name": relative, "path": str(IMAGES_DIR / relative), "dataset": "civil" if stem.startswith("civil_") else "open" if stem.startswith("open_") else "other", "has_label": True, "has_mask": True})
+        _image_list_loaded = True
+        return
     
     if not IMAGES_DIR.exists():
         print(f"[Cache] Images directory not found: {IMAGES_DIR}")
@@ -2529,6 +2592,32 @@ def api_export_final_dataset():
     try:
         _load_image_list()
         export_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_final"
+        # A direct import can be several GB.  Create its export with R2-to-R2
+        # copies instead of downloading every image into Render's 10GB disk.
+        if _active_dataset_manifest and isinstance(R2, R2Storage) and _active_dataset_remote_root:
+            root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+            prefix = root + "/" if root else ""
+            remote_export = f"{_active_dataset_remote_root}/{prefix}final_exports/{export_id}"
+            files = list(_active_dataset_manifest.get("files", []))
+            samples = []
+            for image_info in _image_list_cache:
+                stem, name = image_info["stem"], image_info["name"]
+                image_source = f"{prefix}images/{name}"
+                R2.copy_file(f"{_active_dataset_remote_root}/{image_source}", f"{remote_export}/images/{name}")
+                expert_label = f"{prefix}expert_labels/{stem}.json"
+                algorithm_label = next((item for item in files if item.startswith(prefix + "detections/") or item.startswith(prefix + "algorithm_labels/") or item.startswith(prefix + "labels/") if Path(item).stem.startswith(stem) or Path(item).stem.startswith(_sample_key(stem))), None)
+                label_source = expert_label if R2.get_bytes(f"{_active_dataset_remote_root}/{expert_label}") is not None else algorithm_label
+                if label_source:
+                    R2.copy_file(f"{_active_dataset_remote_root}/{label_source}", f"{remote_export}/labels/{stem}.json")
+                expert_mask = f"{prefix}expert_masks/{stem}_mask.png"
+                algorithm_mask = next((item for item in files if any(item.startswith(prefix + folder + "/") for folder in ("masks", "algorithm_masks")) and (Path(item).stem.startswith(stem) or Path(item).stem.startswith(_sample_key(stem)))), None)
+                mask_source = expert_mask if R2.get_bytes(f"{_active_dataset_remote_root}/{expert_mask}") is not None else algorithm_mask
+                if mask_source:
+                    R2.copy_file(f"{_active_dataset_remote_root}/{mask_source}", f"{remote_export}/masks/{stem}_mask.png")
+                samples.append({"sample_id": stem, "image": f"images/{name}", "label": f"labels/{stem}.json" if label_source else None, "mask": f"masks/{stem}_mask.png" if mask_source else None})
+            manifest = {"created_at": datetime.now(timezone.utc).isoformat(), "total_images": len(samples), "selection_rule": "expert result when present; otherwise algorithm result", "samples": samples}
+            R2.put_bytes(json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"), f"{remote_export}/manifest.json")
+            return jsonify({"success": True, "total": len(samples), "folder": f"final_exports/{export_id}", "cloud_persisted": True, "direct": True})
         export_dir = FINAL_EXPORTS_DIR / export_id
         images_output = export_dir / "images"
         labels_output = export_dir / "labels"
@@ -2691,6 +2780,10 @@ def api_direct_upload_start():
                 raise ValueError("文件大小无效。")
             remote_relative = f"datasets/{import_id}/{relative_name}"
             uploads.append({"path": relative_name, "url": R2.presign_put(remote_relative)})
+        # Persist the file list before the browser begins uploading.  Completion
+        # can now validate and open the batch without listing/downloading 3.8GB.
+        manifest = {"files": sorted(seen), "created_at": datetime.now(timezone.utc).isoformat()}
+        R2.put_bytes(json.dumps(manifest, ensure_ascii=False).encode("utf-8"), f"datasets/{import_id}/.upload_manifest.json")
         return jsonify({"success": True, "upload_id": import_id, "uploads": uploads, "expires_in": 3600})
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 400
@@ -2704,25 +2797,37 @@ def api_direct_upload_complete():
     suffix = upload_id[len("direct_"):] if upload_id.startswith("direct_") else ""
     if len(suffix) != 32 or not all(ch in "0123456789abcdef" for ch in suffix):
         return jsonify({"success": False, "error": "上传批次标识无效。"}), 400
-    destination = IMPORT_ROOT / f"dataset_{upload_id}"
     remote_root = f"datasets/{upload_id}"
     try:
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.mkdir(parents=True, exist_ok=False)
-        downloaded = R2.get_tree(remote_root, destination)
-        dataset_root = _find_imported_dataset_root(destination)
-        if dataset_root is None:
+        manifest_bytes = R2.get_bytes(f"{remote_root}/.upload_manifest.json")
+        if not manifest_bytes:
+            raise ValueError("上传清单不存在，请重新开始导入。")
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        files = [str(item) for item in manifest.get("files", [])]
+        candidates = []
+        for name in files:
+            parts = PurePosixPath(name).parts
+            if "images" in parts:
+                candidates.append("/".join(parts[:parts.index("images")]))
+        relative_root = next((root for root in sorted(set(candidates), key=len) if any(path.startswith((root + "/" if root else "") + "images/") for path in files) and any(path.startswith((root + "/" if root else "") + folder + "/") for folder in ("detections", "algorithm_labels", "labels")) and any(path.startswith((root + "/" if root else "") + folder + "/") for folder in ("masks", "algorithm_masks"))), None)
+        if relative_root is None:
             raise ValueError("未找到 images/、detections/（或 labels/）和 masks/ 子文件夹。")
-        global _active_dataset_loaded, _active_dataset_local_import_root
+        manifest["dataset_relative_root"] = relative_root
+        destination = IMPORT_ROOT / f"dataset_{upload_id}"
+        destination.mkdir(parents=True, exist_ok=True)
+        dataset_root = destination.joinpath(*PurePosixPath(relative_root).parts)
+        for folder in ("images", "labels", "detections", "algorithm_labels", "masks", "algorithm_masks", "metadata", "expert_labels", "expert_masks", "revisions"):
+            (dataset_root / folder).mkdir(parents=True, exist_ok=True)
+        global _active_dataset_loaded, _active_dataset_local_import_root, _active_dataset_manifest
         _active_dataset_loaded = True
         _active_dataset_local_import_root = destination
+        _active_dataset_manifest = manifest
         _configure_dataset_root(dataset_root)
         _load_image_list()
         if not _image_list_cache:
             raise ValueError("images/ 子文件夹中没有可读取的 JPG 或 PNG 图片。")
         _remember_remote_dataset(destination, dataset_root, remote_root)
-        return jsonify({"success": True, "dataset_name": dataset_root.name, "total": len(_image_list_cache), "imported_files": downloaded, "cloud_persisted": True})
+        return jsonify({"success": True, "dataset_name": dataset_root.name, "total": len(_image_list_cache), "imported_files": len(files), "cloud_persisted": True, "direct": True})
     except Exception as error:
         print(f"[Direct import] Failed: {error}")
         return jsonify({"success": False, "error": str(error)}), 400
@@ -2772,10 +2877,11 @@ def api_import_dataset():
 
         # Do not restore the previously active cloud batch while validating a
         # newly uploaded one.
-        global _active_dataset_loaded, _active_dataset_local_import_root
+        global _active_dataset_loaded, _active_dataset_local_import_root, _active_dataset_manifest
         if R2.enabled:
             _active_dataset_loaded = True
             _active_dataset_local_import_root = destination
+            _active_dataset_manifest = None
         _configure_dataset_root(dataset_root)
         _load_image_list()
         if not _image_list_cache:
@@ -2825,6 +2931,7 @@ def api_image(index: int):
     
     img_info = filtered[index]
     stem = img_info['stem']
+    _materialize_sample(stem)
     img_path = Path(img_info['path'])
     # Stable user-facing number: position in the full, unfiltered batch.
     _load_image_list()
@@ -2922,6 +3029,7 @@ def api_save():
         
         img_info = filtered[index]
         stem = img_info['stem']
+        _materialize_sample(stem)
         before_bboxes = _load_bboxes_for_image(stem)
         
         # Save bbox modifications
