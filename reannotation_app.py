@@ -1637,7 +1637,7 @@ HTML_TEMPLATE = """
         }
 
         function directUploadFingerprint(entries) {
-            return entries.map(entry => `${entry.path}|${entry.size}|${entry.modified}`).sort().join('\n');
+            return entries.map(entry => `${entry.path}|${entry.size}|${entry.modified}`).sort().join('\\n');
         }
 
         async function importDatasetFolderDirect(files, importButton) {
