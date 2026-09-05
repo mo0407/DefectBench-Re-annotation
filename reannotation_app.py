@@ -1300,7 +1300,9 @@ HTML_TEMPLATE = """
                 <input id="ossBulkLocalPath" type="text" placeholder="例如：E:\\data\\test_input" oninput="renderOssBulkCommand()" style="width:100%; margin-bottom:9px;">
                 <label style="font-size:13px; display:block; margin-bottom:5px;">上传命令</label>
                 <textarea id="ossBulkCommand" readonly rows="4" style="width:100%; font-family:Consolas, monospace; font-size:12px; margin-bottom:9px;"></textarea>
-                <div style="display:flex; gap:8px; align-items:center; margin-bottom:14px;"><button type="button" onclick="copyOssBulkCommand()">复制命令</button><input id="ossBulkUploadId" type="text" placeholder="批次标识" style="flex:1;"><button id="ossBulkRegisterButton" type="button" onclick="registerOssBulkBatch()">2. 登记并载入</button></div>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:9px;"><button type="button" onclick="copyOssBulkCommand()">复制命令</button><input id="ossBulkUploadId" type="text" placeholder="批次标识" style="flex:1;"></div>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:14px;"><button type="button" onclick="document.getElementById('ossBulkManifestInput').click()">2. 选择已上传文件夹</button><span id="ossBulkManifestState" style="font-size:13px; color:#52606d; flex:1;">仅读取文件名，不会再次上传文件。</span><button id="ossBulkRegisterButton" type="button" onclick="registerOssBulkBatch()">3. 登记并载入</button></div>
+                <input id="ossBulkManifestInput" type="file" webkitdirectory directory multiple hidden onchange="setOssBulkManifest(event)">
                 <div style="display:flex; justify-content:flex-end;"><button type="button" onclick="closeOssBulkDialog()" style="background:#64748b;">关闭</button></div>
             </div>
         </div>
@@ -1472,6 +1474,7 @@ HTML_TEMPLATE = """
         }
 
         let ossBulkInfo = null;
+        let ossBulkManifestFiles = [];
 
         function setOssBulkState(message, type = 'info') {
             const state = document.getElementById('ossBulkState');
@@ -1498,6 +1501,14 @@ HTML_TEMPLATE = """
             const localPath = document.getElementById('ossBulkLocalPath').value.trim() || 'E:\\data\\your_dataset';
             const checkpoint = localPath.replace(/[\\/]+$/, '') + '\\ossutil-checkpoint';
             output.value = `ossutil cp -r -f -u "${localPath}" "${ossBulkInfo.destination}" --checkpoint-dir "${checkpoint}" -j 10 --parallel 10`;
+        }
+
+        function setOssBulkManifest(event) {
+            const files = Array.from(event.target.files || []);
+            ossBulkManifestFiles = files.map(file => file.webkitRelativePath || file.name).filter(Boolean);
+            document.getElementById('ossBulkManifestState').textContent = ossBulkManifestFiles.length
+                ? `已读取 ${ossBulkManifestFiles.length} 个文件名；不会重新上传内容。`
+                : '未选择文件夹。';
         }
 
         async function createOssBulkBatch() {
@@ -1541,11 +1552,16 @@ HTML_TEMPLATE = """
             const uploadId = document.getElementById('ossBulkUploadId').value.trim();
             const button = document.getElementById('ossBulkRegisterButton');
             if (!uploadId) return;
+            if (!ossBulkManifestFiles.length) {
+                setOssBulkState('请先选择已通过 ossutil 上传的同一数据文件夹；网页只会读取文件名。', 'error');
+                return;
+            }
             button.disabled = true;
-            setOssBulkState('正在扫描 OSS 中已上传的文件…');
+            setOssBulkState('正在使用本地文件清单登记 OSS 批次…');
             try {
                 const registerResponse = await fetch('/api/oss_bulk/register', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ upload_id: uploadId, files: ossBulkManifestFiles })
                 });
                 const registered = await parseApiJson(registerResponse);
                 if (!registerResponse.ok || !registered.success) throw new Error(registered.error || '登记失败');
@@ -3213,12 +3229,19 @@ def api_oss_bulk_register():
     """Build the app manifest for files uploaded outside the browser."""
     if not R2.enabled:
         return jsonify({"success": False, "error": "对象存储尚未配置。"}), 400
-    upload_id = str((request.get_json(silent=True) or {}).get("upload_id") or "")
+    data = request.get_json(silent=True) or {}
+    upload_id = str(data.get("upload_id") or "")
     if not _valid_direct_upload_id(upload_id):
         return jsonify({"success": False, "error": "批次标识无效。请使用网页生成的批次标识。"}), 400
     try:
         remote_root = f"datasets/{upload_id}"
-        files = sorted(name for name in R2.list_relative(remote_root) if name != ".upload_manifest.json")
+        submitted_files = data.get("files")
+        if not isinstance(submitted_files, list) or not submitted_files:
+            raise ValueError("请选择源电脑上已上传的同一数据文件夹，以提供文件清单。")
+        max_files = int(os.environ.get("DIRECT_UPLOAD_MAX_FILES", "20000"))
+        if len(submitted_files) > max_files:
+            raise ValueError(f"文件数超过上限 {max_files}。")
+        files = sorted({_safe_upload_relative_path(name) for name in submitted_files})
         if not files:
             raise ValueError("该批次尚未发现上传文件。请确认 ossutil 的目标路径。")
         manifest = {"files": files, "created_at": datetime.now(timezone.utc).isoformat(), "upload_method": "ossutil"}
