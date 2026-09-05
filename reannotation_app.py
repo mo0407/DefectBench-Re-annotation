@@ -740,7 +740,10 @@ def _load_bboxes_for_image(stem: str, *, baseline: bool = False) -> List[Dict[st
     if baseline:
         return _load_bboxes_from_path(_baseline_label_path(stem))
     expert_path = EXPERT_LABELS_DIR / f"{stem}.json"
-    return _load_bboxes_from_path(expert_path if expert_path.exists() else ALGORITHM_LABELS_DIR / f"{stem}.json")
+    # The supplied detector uses ``<sample>_detection.json`` while the image
+    # uses ``<sample>_image.jpg``.  Reuse the baseline resolver rather than
+    # assuming an exact ``<image-stem>.json`` filename.
+    return _load_bboxes_from_path(expert_path if expert_path.exists() else _baseline_label_path(stem))
 
 
 def _load_mask_for_image(stem: str, *, baseline: bool = False) -> Optional[np.ndarray]:
