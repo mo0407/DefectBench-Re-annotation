@@ -206,6 +206,15 @@ class R2Storage:
                 return False
             raise
 
+    def object_exists(self, relative: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=self.key(relative))
+            return True
+        except Exception as error:
+            return getattr(error, "response", {}).get("Error", {}).get("Code") not in {"NoSuchKey", "404", "NoSuchBucket"}
+
     def copy_file(self, source_relative: str, target_relative: str) -> None:
         """Server-side R2 copy, so export files never occupy Render disk."""
         self.client.copy_object(Bucket=self.bucket, Key=self.key(target_relative), CopySource={"Bucket": self.bucket, "Key": self.key(source_relative)})
@@ -291,6 +300,15 @@ class OSSStorage:
             return self.client.get_object(self.key(relative)).read()
         except oss2.exceptions.NoSuchKey:
             return None
+
+    def object_exists(self, relative: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            self.client.get_object_meta(self.key(relative))
+            return True
+        except oss2.exceptions.NoSuchKey:
+            return False
 
     def put_tree(self, local_root: Path, remote_root: str) -> None:
         if not self.enabled:
@@ -1497,30 +1515,61 @@ HTML_TEMPLATE = """
             }
         }
 
-        async function importDatasetFolderDirect(files, importButton) {
-            const startResponse = await fetch('/api/direct_upload/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ files: files.map(file => ({
-                    path: file.webkitRelativePath || file.name,
-                    size: file.size,
-                    content_type: file.type || ''
-                })) })
-            });
-            const start = await startResponse.json();
-            if (!startResponse.ok || !start.success) throw new Error(start.error || '无法创建直传任务');
-            if (!Array.isArray(start.uploads) || start.uploads.length !== files.length) {
-                throw new Error('直传任务文件清单不完整');
-            }
+        const DIRECT_UPLOAD_SESSION_KEY = 'defectbench.direct-upload-session.v1';
 
-            let completed = 0;
+        function directUploadEntries(files) {
+            return files.map(file => ({
+                path: file.webkitRelativePath || file.name,
+                size: file.size,
+                modified: file.lastModified,
+                content_type: file.type || ''
+            }));
+        }
+
+        function directUploadFingerprint(entries) {
+            return entries.map(entry => `${entry.path}|${entry.size}|${entry.modified}`).sort().join('\n');
+        }
+
+        async function importDatasetFolderDirect(files, importButton) {
+            const entries = directUploadEntries(files);
+            const fingerprint = directUploadFingerprint(entries);
+            const filesByPath = new Map(files.map(file => [file.webkitRelativePath || file.name, file]));
+            let savedSession = null;
+            try { savedSession = JSON.parse(localStorage.getItem(DIRECT_UPLOAD_SESSION_KEY) || 'null'); } catch (_) {}
+
+            let startResponse;
+            if (savedSession && savedSession.fingerprint === fingerprint && savedSession.upload_id) {
+                importButton.textContent = '正在恢复未完成上传…';
+                startResponse = await fetch('/api/direct_upload/resume', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ upload_id: savedSession.upload_id, files: entries })
+                });
+            } else {
+                startResponse = await fetch('/api/direct_upload/start', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ files: entries })
+                });
+            }
+            let start = await startResponse.json();
+            if (!startResponse.ok || !start.success) {
+                // A stale local record should not block a new upload attempt.
+                if (savedSession) localStorage.removeItem(DIRECT_UPLOAD_SESSION_KEY);
+                throw new Error(start.error || '无法创建或恢复直传任务');
+            }
+            localStorage.setItem(DIRECT_UPLOAD_SESSION_KEY, JSON.stringify({ upload_id: start.upload_id, fingerprint }));
+            if (!Array.isArray(start.uploads)) throw new Error('直传任务文件清单不完整');
+
+            let completed = Number(start.completed || 0);
             const updateProgress = () => {
                 importButton.textContent = `正在直传对象存储… ${completed}/${files.length}`;
             };
             let nextIndex = 0;
             const uploadWorker = async () => {
-                while (nextIndex < files.length) {
+                while (nextIndex < start.uploads.length) {
                     const index = nextIndex++;
+                    const upload = start.uploads[index];
+                    const file = filesByPath.get(upload.path);
+                    if (!file) throw new Error(`本地未找到文件：${upload.path}`);
                     let lastError = '';
                     let putResponse;
                     // Browser-to-object-storage uploads occasionally lose one
@@ -1528,9 +1577,9 @@ HTML_TEMPLATE = """
                     // the operator to restart a complete batch.
                     for (let attempt = 1; attempt <= 3; attempt++) {
                         try {
-                            const contentType = files[index].type || '';
-                            putResponse = await fetch(start.uploads[index].url, {
-                                method: 'PUT', body: files[index],
+                            const contentType = file.type || '';
+                            putResponse = await fetch(upload.url, {
+                                method: 'PUT', body: file,
                                 headers: contentType ? { 'Content-Type': contentType } : undefined
                             });
                             if (putResponse.ok) break;
@@ -1542,19 +1591,21 @@ HTML_TEMPLATE = """
                         if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 800));
                     }
                     if (!putResponse || !putResponse.ok) {
-                        throw new Error(`上传失败：${start.uploads[index].path}（${lastError || '未知错误'}）`);
+                        throw new Error(`上传失败：${upload.path}（${lastError || '未知错误'}）`);
                     }
                     completed += 1;
                     updateProgress();
                 }
             };
             updateProgress();
-            await Promise.all(Array.from({ length: Math.min(4, files.length) }, uploadWorker));
+            await Promise.all(Array.from({ length: Math.min(4, start.uploads.length) }, uploadWorker));
             importButton.textContent = '正在校验并载入…';
-            return fetch('/api/direct_upload/complete', {
+            const completeResponse = await fetch('/api/direct_upload/complete', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ upload_id: start.upload_id })
             });
+            if (completeResponse.ok) localStorage.removeItem(DIRECT_UPLOAD_SESSION_KEY);
+            return completeResponse;
         }
         
         // Initialize
@@ -2984,6 +3035,11 @@ def _find_imported_dataset_root(destination: Path) -> Optional[Path]:
     )
 
 
+def _direct_upload_ttl() -> int:
+    """Keep large-batch browser upload URLs usable for a realistic session."""
+    return max(3600, min(int(os.environ.get("DIRECT_UPLOAD_URL_TTL", "21600")), 86400))
+
+
 @app.route("/api/direct_upload/start", methods=["POST"])
 def api_direct_upload_start():
     if not R2.enabled:
@@ -2997,6 +3053,7 @@ def api_direct_upload_start():
         return jsonify({"success": False, "error": f"单次最多支持 {max_files} 个文件。"}), 400
     try:
         import_id = "direct_" + uuid.uuid4().hex
+        expires_in = _direct_upload_ttl()
         # R2 can configure CORS through its S3 API.  OSS CORS is configured in
         # the OSS console once, and then uses the same signed-upload protocol.
         if isinstance(R2, R2Storage):
@@ -3014,12 +3071,57 @@ def api_direct_upload_start():
                 raise ValueError("文件大小无效。")
             content_type = str(entry.get("content_type") or "").strip()[:200]
             remote_relative = f"datasets/{import_id}/{relative_name}"
-            uploads.append({"path": relative_name, "url": R2.presign_put(remote_relative, content_type=content_type)})
+            uploads.append({"path": relative_name, "url": R2.presign_put(remote_relative, expires_in=expires_in, content_type=content_type)})
         # Persist the file list before the browser begins uploading.  Completion
         # can now validate and open the batch without listing/downloading 3.8GB.
         manifest = {"files": sorted(seen), "created_at": datetime.now(timezone.utc).isoformat()}
         R2.put_bytes(json.dumps(manifest, ensure_ascii=False).encode("utf-8"), f"datasets/{import_id}/.upload_manifest.json")
-        return jsonify({"success": True, "upload_id": import_id, "uploads": uploads, "expires_in": 3600})
+        return jsonify({"success": True, "upload_id": import_id, "uploads": uploads, "expires_in": expires_in})
+    except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@app.route("/api/direct_upload/resume", methods=["POST"])
+def api_direct_upload_resume():
+    """Return fresh signed URLs only for files absent from an interrupted batch."""
+    if not R2.enabled:
+        return jsonify({"success": False, "error": "直传需要先配置 OSS 或 Cloudflare R2。"}), 400
+    data = request.get_json(silent=True) or {}
+    upload_id = str(data.get("upload_id") or "")
+    entries = data.get("files")
+    suffix = upload_id[len("direct_"):] if upload_id.startswith("direct_") else ""
+    if len(suffix) != 32 or not all(ch in "0123456789abcdef" for ch in suffix):
+        return jsonify({"success": False, "error": "上传批次标识无效。"}), 400
+    if not isinstance(entries, list) or not entries:
+        return jsonify({"success": False, "error": "请选择要继续上传的文件夹。"}), 400
+    try:
+        manifest_bytes = R2.get_bytes(f"datasets/{upload_id}/.upload_manifest.json")
+        if not manifest_bytes:
+            raise ValueError("未找到之前的上传批次，请重新开始导入。")
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        expected = set(str(item) for item in manifest.get("files", []))
+        supplied: Dict[str, Dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("上传文件信息格式错误。")
+            relative_name = _safe_upload_relative_path(entry.get("path"))
+            if relative_name in supplied:
+                raise ValueError(f"存在重复文件路径：{relative_name}")
+            supplied[relative_name] = entry
+        if set(supplied) != expected:
+            raise ValueError("所选文件夹与未完成批次不一致，请重新选择原文件夹。")
+
+        expires_in = _direct_upload_ttl()
+        uploads: List[Dict[str, str]] = []
+        for relative_name in sorted(expected):
+            if R2.object_exists(f"datasets/{upload_id}/{relative_name}"):
+                continue
+            content_type = str(supplied[relative_name].get("content_type") or "").strip()[:200]
+            uploads.append({
+                "path": relative_name,
+                "url": R2.presign_put(f"datasets/{upload_id}/{relative_name}", expires_in=expires_in, content_type=content_type),
+            })
+        return jsonify({"success": True, "upload_id": upload_id, "uploads": uploads, "completed": len(expected) - len(uploads), "expires_in": expires_in})
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 400
 
@@ -3039,6 +3141,9 @@ def api_direct_upload_complete():
             raise ValueError("上传清单不存在，请重新开始导入。")
         manifest = json.loads(manifest_bytes.decode("utf-8"))
         files = [str(item) for item in manifest.get("files", [])]
+        missing = [name for name in files if not R2.object_exists(f"{remote_root}/{name}")]
+        if missing:
+            raise ValueError(f"仍有 {len(missing)} 个文件未上传完成，请重新选择同一文件夹后继续上传。")
         candidates = []
         for name in files:
             parts = PurePosixPath(name).parts
