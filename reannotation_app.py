@@ -1713,7 +1713,7 @@ HTML_TEMPLATE = """
                 
                 showStatus('bboxStatus', 'Image loaded successfully', 'success');
                 showStatus('maskStatus', 'Image loaded successfully', 'success');
-                prefetchNextImage(data.next_image);
+                prefetchMedia(data.prefetch_media || []);
                 
             } catch (error) {
                 console.error('Failed to load image:', error);
@@ -1772,7 +1772,10 @@ HTML_TEMPLATE = """
         function loadImageFromBase64(base64Str) {
             return new Promise((resolve, reject) => {
                 const img = new Image();
-                img.onload = () => resolve(img);
+                img.onload = () => {
+                    retainMedia(base64Str, img);
+                    resolve(img);
+                };
                 img.onerror = () => reject(new Error('Image or mask request failed'));
                 setCanvasImageSource(img, base64Str);
             });
@@ -1799,12 +1802,35 @@ HTML_TEMPLATE = """
             });
         }
 
-        // Warm the browser cache for the next original image.  This only
-        // applies to cloud URLs; data URLs and local mode remain unchanged.
-        function prefetchNextImage(source) {
-            if (!source) return;
-            const image = new Image();
-            setCanvasImageSource(image, source);
+        // Keep a bounded image cache: the current/seen images stay available
+        // while the next three samples are fetched in the background.  The
+        // bound avoids consuming several GB of browser memory on a long batch.
+        const mediaCache = new Map();
+        const MAX_MEDIA_CACHE_ITEMS = 16;
+
+        function retainMedia(source, image) {
+            if (!source || !/^https?:\/\//i.test(source)) return;
+            if (mediaCache.has(source)) mediaCache.delete(source);
+            mediaCache.set(source, image);
+            while (mediaCache.size > MAX_MEDIA_CACHE_ITEMS) {
+                mediaCache.delete(mediaCache.keys().next().value);
+            }
+        }
+
+        function prefetchMedia(sources) {
+            sources.forEach(source => {
+                if (!source || mediaCache.has(source)) return;
+                const image = new Image();
+                image.onload = () => retainMedia(source, image);
+                image.onerror = () => mediaCache.delete(source);
+                setCanvasImageSource(image, source);
+                // Reserve a slot immediately so repeated image switches do
+                // not launch duplicate downloads for the same object.
+                mediaCache.set(source, image);
+                while (mediaCache.size > MAX_MEDIA_CACHE_ITEMS) {
+                    mediaCache.delete(mediaCache.keys().next().value);
+                }
+            });
         }
         
         // Clone Image object
@@ -3215,6 +3241,19 @@ def api_image(index: int):
             _direct_browser_url(f"{prefix}images/{filtered[index + 1]['name']}")
             if index + 1 < len(filtered) else None
         )
+        # Supply a short look-ahead window without downloading the files in
+        # Flask.  The browser starts these direct object requests after the
+        # current annotation is ready.
+        prefetch_media: List[str] = []
+        for lookahead in filtered[index + 1:index + 4]:
+            next_stem = lookahead["stem"]
+            next_image = _direct_browser_url(f"{prefix}images/{lookahead['name']}")
+            next_mask_rel = _direct_manifest_file(next_stem, ("algorithm_masks", "masks"), mask=True)
+            next_mask = _direct_browser_url(next_mask_rel)
+            if next_image:
+                prefetch_media.append(next_image)
+            if next_mask:
+                prefetch_media.append(next_mask)
     else:
         img = Image.open(img_path)
         img_rgb = img.convert("RGB")
@@ -3223,6 +3262,7 @@ def api_image(index: int):
         img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
         image_data_url = f"data:image/jpeg;base64,{img_base64}"
         next_image_url = None
+        prefetch_media = []
     
     # For a browser-direct import the working cache is deliberately sparse.
     # Read its two input sidecars from object storage by their manifest paths,
@@ -3303,6 +3343,7 @@ def api_image(index: int):
         "filename": img_info['name'],
         "image": image_data_url,
         "next_image": next_image_url,
+        "prefetch_media": prefetch_media,
         "bboxes": bbox_list,
         "algorithm_bboxes": algorithm_bbox_list,
         "mask": mask_data_url,
