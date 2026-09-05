@@ -38,7 +38,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 import pandas as pd
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 from PIL import Image, ImageDraw
 
 try:
@@ -1674,6 +1674,7 @@ HTML_TEMPLATE = """
                 
                 showStatus('bboxStatus', 'Image loaded successfully', 'success');
                 showStatus('maskStatus', 'Image loaded successfully', 'success');
+                prefetchNextImage(index, data.total);
                 
             } catch (error) {
                 console.error('Failed to load image:', error);
@@ -1730,11 +1731,25 @@ HTML_TEMPLATE = """
         
         // Load image from base64
         function loadImageFromBase64(base64Str) {
-            return new Promise((resolve) => {
+            return new Promise((resolve, reject) => {
                 const img = new Image();
                 img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error('Image or mask request failed'));
                 img.src = base64Str;
             });
+        }
+
+        // Warm the browser cache for the next original image.  This only
+        // applies to cloud URLs; data URLs and local mode remain unchanged.
+        function prefetchNextImage(index, total) {
+            const nextIndex = index + 1;
+            if (nextIndex >= total) return;
+            const params = new URLSearchParams();
+            if (currentDataset) params.append('dataset', currentDataset);
+            if (currentPrimaryClass) params.append('primary_class', currentPrimaryClass);
+            const query = params.toString();
+            const image = new Image();
+            image.src = `/api/media/${nextIndex}/image${query ? '?' + query : ''}`;
         }
         
         // Clone Image object
@@ -3061,6 +3076,52 @@ def api_history(stem: str):
     return jsonify({"sample_id": stem, "events": events})
 
 
+@app.route("/api/media/<int:index>/<kind>")
+def api_media(index: int, kind: str):
+    """Return one cloud object as normal image bytes, never as Base64 JSON."""
+    if not (_active_dataset_manifest and R2.enabled and _active_dataset_remote_root):
+        return jsonify({"error": "cloud media is unavailable"}), 404
+    if kind not in {"image", "mask", "algorithm_mask"}:
+        return jsonify({"error": "invalid media type"}), 404
+
+    dataset = request.args.get("dataset") or None
+    primary_class = request.args.get("primary_class") or None
+    filtered = _get_filtered_images(dataset, primary_class)
+    if index < 0 or index >= len(filtered):
+        return jsonify({"error": "index out of range"}), 404
+
+    image_info = filtered[index]
+    stem = image_info["stem"]
+    root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+    prefix = root + "/" if root else ""
+    if kind == "image":
+        relative = f"{prefix}images/{image_info['name']}"
+        suffix = Path(image_info["name"]).suffix.lower()
+        mimetype = "image/png" if suffix == ".png" else "image/jpeg"
+    else:
+        algorithm_relative = _direct_manifest_file(stem, ("algorithm_masks", "masks"), mask=True)
+        if kind == "algorithm_mask":
+            relative = algorithm_relative
+        else:
+            # A save always writes the expert label and mask together.  Try the
+            # expert result first, then use the imported algorithm mask.
+            expert_relative = f"{prefix}expert_masks/{stem}_mask.png"
+            payload = _direct_object_bytes(expert_relative)
+            if payload is not None:
+                response = Response(payload, mimetype="image/png")
+                response.headers["Cache-Control"] = "no-store"
+                return response
+            relative = algorithm_relative
+        mimetype = "image/png"
+
+    payload = _direct_object_bytes(relative)
+    if payload is None:
+        return jsonify({"error": "media not found"}), 404
+    response = Response(payload, mimetype=mimetype)
+    response.headers["Cache-Control"] = "public, max-age=3600" if kind == "image" else "no-store"
+    return response
+
+
 @app.route("/api/image/<int:index>")
 def api_image(index: int):
     """Get image data by index"""
@@ -3074,7 +3135,9 @@ def api_image(index: int):
     
     img_info = filtered[index]
     stem = img_info['stem']
-    _materialize_sample(stem)
+    direct_mode = bool(_active_dataset_manifest and R2.enabled and _active_dataset_remote_root)
+    if not direct_mode:
+        _materialize_sample(stem)
     img_path = Path(img_info['path'])
     # Stable user-facing number: position in the full, unfiltered batch.
     _load_image_list()
@@ -3083,19 +3146,24 @@ def api_image(index: int):
         None,
     )
     
-    # Read image and convert to base64
-    img = Image.open(img_path)
-    img_rgb = img.convert("RGB")
-    buffer = io.BytesIO()
-    img_rgb.save(buffer, format="JPEG")
-    img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    image_data_url = f"data:image/jpeg;base64,{img_base64}"
+    query = request.query_string.decode("utf-8")
+    media_query = f"?{query}" if query else ""
+    if direct_mode:
+        # The browser makes independent requests for media.  The annotation
+        # response is consequently small and box editing can start at once.
+        image_data_url = f"/api/media/{index}/image{media_query}"
+    else:
+        img = Image.open(img_path)
+        img_rgb = img.convert("RGB")
+        buffer = io.BytesIO()
+        img_rgb.save(buffer, format="JPEG")
+        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        image_data_url = f"data:image/jpeg;base64,{img_base64}"
     
     # For a browser-direct import the working cache is deliberately sparse.
     # Read its two input sidecars from object storage by their manifest paths,
     # rather than letting an empty cache directory make the annotation appear
     # to be missing.  Local imports retain the normal file-based behaviour.
-    direct_mode = bool(_active_dataset_manifest and R2.enabled and _active_dataset_remote_root)
     has_expert_version = False
     if direct_mode:
         algorithm_label_rel = _direct_manifest_file(stem, ("algorithm_labels", "detections", "labels"))
@@ -3137,35 +3205,29 @@ def api_image(index: int):
             "score": bbox_data.get("score"),
         })
     
-    # Load mask.  As above, use direct object reads for a cloud-direct batch.
+    # Load mask.  For cloud batches, return media URLs rather than decoding
+    # and Base64-encoding a potentially large PNG inside the web worker.
     if direct_mode:
         algorithm_mask_rel = _direct_manifest_file(stem, ("algorithm_masks", "masks"), mask=True)
-        algorithm_mask_rgb = _mask_from_bytes(_direct_object_bytes(algorithm_mask_rel))
-        expert_mask_rgb = _mask_from_bytes(_direct_object_bytes(f"{prefix}expert_masks/{stem}_mask.png"))
-        if expert_mask_rgb is not None:
-            mask_rgb = expert_mask_rgb
-            has_expert_version = True
-        else:
-            mask_rgb = algorithm_mask_rgb
+        mask_data_url = f"/api/media/{index}/mask{media_query}" if algorithm_mask_rel else None
+        algorithm_mask_data_url = f"/api/media/{index}/algorithm_mask{media_query}" if algorithm_mask_rel else None
+        mask_rgb = None
+        algorithm_mask_rgb = None
     else:
         mask_rgb = _load_mask_for_image(stem)
         algorithm_mask_rgb = _load_mask_for_image(stem, baseline=True)
-
-    mask_data_url = None
-    # A direct import has no expert output initially.  Explicitly make the
-    # algorithm data the displayed Mask instead of relying on a later UI step.
-    if mask_rgb is None and algorithm_mask_rgb is not None:
-        mask_rgb = algorithm_mask_rgb
-    if mask_rgb is not None:
-        mask_buffer = io.BytesIO()
-        Image.fromarray(mask_rgb).save(mask_buffer, format="PNG")
-        mask_data_url = "data:image/png;base64," + base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
-
-    algorithm_mask_data_url = None
-    if algorithm_mask_rgb is not None:
-        algorithm_buffer = io.BytesIO()
-        Image.fromarray(algorithm_mask_rgb).save(algorithm_buffer, format="PNG")
-        algorithm_mask_data_url = "data:image/png;base64," + base64.b64encode(algorithm_buffer.getvalue()).decode("utf-8")
+        mask_data_url = None
+        if mask_rgb is None and algorithm_mask_rgb is not None:
+            mask_rgb = algorithm_mask_rgb
+        if mask_rgb is not None:
+            mask_buffer = io.BytesIO()
+            Image.fromarray(mask_rgb).save(mask_buffer, format="PNG")
+            mask_data_url = "data:image/png;base64," + base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+        algorithm_mask_data_url = None
+        if algorithm_mask_rgb is not None:
+            algorithm_buffer = io.BytesIO()
+            Image.fromarray(algorithm_mask_rgb).save(algorithm_buffer, format="PNG")
+            algorithm_mask_data_url = "data:image/png;base64," + base64.b64encode(algorithm_buffer.getvalue()).decode("utf-8")
     
     return jsonify({
         "index": index,
@@ -3179,7 +3241,7 @@ def api_image(index: int):
         "algorithm_mask": algorithm_mask_data_url,
         "algorithm_metadata": algorithm_metadata,
         "has_expert_version": has_expert_version,
-        "mask_source": "expert" if has_expert_version and mask_rgb is not None else "algorithm" if algorithm_mask_rgb is not None else None,
+        "mask_source": "expert" if has_expert_version and mask_data_url is not None else "algorithm" if mask_data_url is not None else None,
     })
 
 
