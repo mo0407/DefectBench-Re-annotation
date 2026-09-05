@@ -1282,7 +1282,8 @@ HTML_TEMPLATE = """
             <div style="width:min(720px, calc(100vw - 36px)); padding:22px; border-radius:9px; background:#fff; box-shadow:0 12px 32px rgba(0,0,0,.28);">
                 <h3 style="margin:0 0 8px;">OSS 批量上传（推荐 4GB 以上数据）</h3>
                 <p style="margin:0 0 12px; color:#52606d; font-size:13px; line-height:1.5;">在存有原始数据的电脑安装 ossutil 2.0。先创建批次，复制命令并在该电脑执行；中断后执行同一条命令即可断点续传。上传完成后回到这里登记并载入。</p>
-                <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;"><button type="button" onclick="createOssBulkBatch()">1. 创建批次</button><span id="ossBulkState" style="font-size:13px; color:#52606d;"></span></div>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;"><button type="button" onclick="createOssBulkBatch()">1. 创建批次</button></div>
+                <div id="ossBulkState" role="status" style="display:none; margin:0 0 10px; padding:8px 10px; border-radius:5px; font-size:13px; line-height:1.45;"></div>
                 <label style="font-size:13px; display:block; margin-bottom:5px;">本地数据集目录（用于生成命令）</label>
                 <input id="ossBulkLocalPath" type="text" placeholder="例如：E:\\data\\test_input" oninput="renderOssBulkCommand()" style="width:100%; margin-bottom:9px;">
                 <label style="font-size:13px; display:block; margin-bottom:5px;">上传命令</label>
@@ -1460,6 +1461,14 @@ HTML_TEMPLATE = """
 
         let ossBulkInfo = null;
 
+        function setOssBulkState(message, type = 'info') {
+            const state = document.getElementById('ossBulkState');
+            state.textContent = message;
+            state.style.display = 'block';
+            state.style.color = type === 'error' ? '#8f1d20' : type === 'success' ? '#146c32' : '#1f4f7a';
+            state.style.background = type === 'error' ? '#f8d7da' : type === 'success' ? '#d4edda' : '#e7f3ff';
+        }
+
         function openOssBulkDialog() {
             document.getElementById('ossBulkDialog').style.display = 'flex';
         }
@@ -1480,18 +1489,17 @@ HTML_TEMPLATE = """
         }
 
         async function createOssBulkBatch() {
-            const state = document.getElementById('ossBulkState');
-            state.textContent = '正在创建…';
+            setOssBulkState('正在创建唯一 OSS 上传批次…');
             try {
                 const response = await fetch('/api/oss_bulk/create', { method: 'POST' });
                 const data = await response.json();
                 if (!response.ok || !data.success) throw new Error(data.error || '创建批次失败');
                 ossBulkInfo = data;
                 document.getElementById('ossBulkUploadId').value = data.upload_id;
-                state.textContent = `已创建：${data.upload_id}`;
+                setOssBulkState(`批次已创建：${data.upload_id}。复制命令并在源电脑执行。`, 'success');
                 renderOssBulkCommand();
             } catch (error) {
-                state.textContent = '创建失败：' + error.message;
+                setOssBulkState('创建失败：' + error.message, 'error');
             }
         }
 
@@ -1500,7 +1508,7 @@ HTML_TEMPLATE = """
             if (!command || command.startsWith('请先')) return;
             try {
                 await navigator.clipboard.writeText(command);
-                document.getElementById('ossBulkState').textContent = '命令已复制。请在源电脑的终端执行。';
+                setOssBulkState('命令已复制。请在源电脑的终端执行；中断后执行同一命令可继续。', 'success');
             } catch (_) {
                 document.getElementById('ossBulkCommand').select();
                 document.execCommand('copy');
@@ -1512,12 +1520,14 @@ HTML_TEMPLATE = """
             const button = document.getElementById('ossBulkRegisterButton');
             if (!uploadId) return;
             button.disabled = true;
+            setOssBulkState('正在扫描 OSS 中已上传的文件…');
             try {
                 const registerResponse = await fetch('/api/oss_bulk/register', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
                 });
                 const registered = await registerResponse.json();
                 if (!registerResponse.ok || !registered.success) throw new Error(registered.error || '登记失败');
+                setOssBulkState(`已发现 ${registered.files} 个文件，正在校验目录并激活数据集…`);
                 const completeResponse = await fetch('/api/direct_upload/complete', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
                 });
@@ -1525,10 +1535,13 @@ HTML_TEMPLATE = """
                 if (!completeResponse.ok || !completed.success) throw new Error(completed.error || '校验或载入失败');
                 resetDatasetUi();
                 await updateImageList();
+                setOssBulkState(`载入成功：${completed.total} 张图片。正在关闭窗口…`, 'success');
+                await new Promise(resolve => setTimeout(resolve, 500));
                 closeOssBulkDialog();
                 showStatus('bboxStatus', `已登记并载入 ${completed.dataset_name}，共 ${completed.total} 张图片`, 'success');
             } catch (error) {
-                document.getElementById('ossBulkState').textContent = '登记失败：' + error.message;
+                console.error('OSS bulk registration failed:', error);
+                setOssBulkState('登记失败：' + error.message, 'error');
             } finally {
                 button.disabled = false;
             }
