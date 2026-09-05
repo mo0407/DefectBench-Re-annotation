@@ -1573,9 +1573,12 @@ HTML_TEMPLATE = """
                 pendingBBox = null;
                 cancelLabelSelection();
                 
-                // Convert mask Image to canvas if exists
-                if (data.mask) {
-                    const maskImg = await loadImageFromBase64(data.mask);
+                // Prefer an expert mask, but always fall back to the algorithm
+                // mask for display.  This keeps a newly imported binary mask
+                // visible before the first expert save.
+                const displayMaskData = data.mask || data.algorithm_mask;
+                if (displayMaskData) {
+                    const maskImg = await loadImageFromBase64(displayMaskData);
                     const img = new Image();
                     await new Promise((resolve) => {
                         img.onload = () => {
@@ -1600,7 +1603,7 @@ HTML_TEMPLATE = """
                 document.getElementById('infoDiv').innerHTML = `
                     <strong>Global #${data.global_index}</strong> | Filtered position ${index + 1} / ${data.total} | 
                     ${data.filename} | Algorithm boxes: ${algorithmBBoxes.length} | Expert boxes: ${currentBBoxes.length} | 
-                    Mask: ${currentMask ? 'Yes' : 'No'}
+                    Mask: ${currentMask ? `Yes (${data.mask_source || 'algorithm'})` : 'No'}
                 `;
                 
                 // Draw
@@ -3067,6 +3070,10 @@ def api_image(index: int):
 
     algorithm_mask_data_url = None
     algorithm_mask_rgb = _load_mask_for_image(stem, baseline=True)
+    # A direct import has no expert output initially.  Explicitly make the
+    # algorithm data the displayed Mask instead of relying on a later UI step.
+    if mask_rgb is None and algorithm_mask_rgb is not None:
+        mask_rgb = algorithm_mask_rgb
     if algorithm_mask_rgb is not None:
         algorithm_buffer = io.BytesIO()
         Image.fromarray(algorithm_mask_rgb).save(algorithm_buffer, format="PNG")
@@ -3084,6 +3091,7 @@ def api_image(index: int):
         "algorithm_mask": algorithm_mask_data_url,
         "algorithm_metadata": algorithm_metadata,
         "has_expert_version": (EXPERT_LABELS_DIR / f"{stem}.json").exists() or bool(_mask_path(EXPERT_MASKS_DIR, stem)),
+        "mask_source": "expert" if _mask_path(EXPERT_MASKS_DIR, stem) else "algorithm" if algorithm_mask_rgb is not None else None,
     })
 
 
