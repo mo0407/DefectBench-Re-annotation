@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from flask import Flask, Response, jsonify, render_template_string, request
+from werkzeug.exceptions import HTTPException
 from PIL import Image, ImageDraw
 
 try:
@@ -72,6 +73,17 @@ except ImportError:
     detection_service = None
 
 app = Flask(__name__)
+
+
+@app.errorhandler(Exception)
+def api_unhandled_error(error: Exception):
+    """Keep API failures machine-readable instead of returning an HTML page."""
+    if isinstance(error, HTTPException):
+        return error
+    print(f"[Unhandled API error] {request.path}: {type(error).__name__}: {error}")
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "error": f"服务端错误：{type(error).__name__}: {error}"}), 500
+    return "Internal server error", 500
 
 # The final DefectBench ontology.  Every saved bbox must use one compatible pair.
 PRIMARY_TO_SUBTYPES: Dict[str, List[str]] = {
@@ -1515,6 +1527,16 @@ HTML_TEMPLATE = """
             }
         }
 
+        async function parseApiJson(response) {
+            const raw = await response.text();
+            try {
+                return JSON.parse(raw);
+            } catch (_) {
+                const summary = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+                throw new Error(`服务端返回 HTTP ${response.status}${summary ? '：' + summary : ''}`);
+            }
+        }
+
         async function registerOssBulkBatch() {
             const uploadId = document.getElementById('ossBulkUploadId').value.trim();
             const button = document.getElementById('ossBulkRegisterButton');
@@ -1525,13 +1547,13 @@ HTML_TEMPLATE = """
                 const registerResponse = await fetch('/api/oss_bulk/register', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
                 });
-                const registered = await registerResponse.json();
+                const registered = await parseApiJson(registerResponse);
                 if (!registerResponse.ok || !registered.success) throw new Error(registered.error || '登记失败');
                 setOssBulkState(`已发现 ${registered.files} 个文件，正在校验目录并激活数据集…`);
                 const completeResponse = await fetch('/api/direct_upload/complete', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
                 });
-                const completed = await completeResponse.json();
+                const completed = await parseApiJson(completeResponse);
                 if (!completeResponse.ok || !completed.success) throw new Error(completed.error || '校验或载入失败');
                 resetDatasetUi();
                 await updateImageList();
