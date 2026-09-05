@@ -1384,16 +1384,33 @@ HTML_TEMPLATE = """
 
             let completed = 0;
             const updateProgress = () => {
-                importButton.textContent = `正在直传 R2… ${completed}/${files.length}`;
+                importButton.textContent = `正在直传对象存储… ${completed}/${files.length}`;
             };
             let nextIndex = 0;
             const uploadWorker = async () => {
                 while (nextIndex < files.length) {
                     const index = nextIndex++;
-                    const putResponse = await fetch(start.uploads[index].url, {
-                        method: 'PUT', body: files[index]
-                    });
-                    if (!putResponse.ok) throw new Error(`上传失败：${start.uploads[index].path}`);
+                    let lastError = '';
+                    let putResponse;
+                    // Browser-to-object-storage uploads occasionally lose one
+                    // connection. Retry the individual file rather than forcing
+                    // the operator to restart a complete batch.
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        try {
+                            putResponse = await fetch(start.uploads[index].url, {
+                                method: 'PUT', body: files[index]
+                            });
+                            if (putResponse.ok) break;
+                            const body = (await putResponse.text()).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+                            lastError = `HTTP ${putResponse.status}${body ? `：${body.slice(0, 180)}` : ''}`;
+                        } catch (error) {
+                            lastError = error.message || '网络连接失败';
+                        }
+                        if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 800));
+                    }
+                    if (!putResponse || !putResponse.ok) {
+                        throw new Error(`上传失败：${start.uploads[index].path}（${lastError || '未知错误'}）`);
+                    }
                     completed += 1;
                     updateProgress();
                 }
