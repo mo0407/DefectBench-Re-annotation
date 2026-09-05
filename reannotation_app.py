@@ -215,6 +215,19 @@ class R2Storage:
         except Exception as error:
             return getattr(error, "response", {}).get("Error", {}).get("Code") not in {"NoSuchKey", "404", "NoSuchBucket"}
 
+    def list_relative(self, relative_prefix: str) -> List[str]:
+        if not self.enabled:
+            return []
+        prefix = self.key(relative_prefix.rstrip("/") + "/")
+        results: List[str] = []
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for item in page.get("Contents", []):
+                key = item["Key"]
+                if key != prefix and not key.endswith("/"):
+                    results.append(key[len(prefix):])
+        return results
+
     def copy_file(self, source_relative: str, target_relative: str) -> None:
         """Server-side R2 copy, so export files never occupy Render disk."""
         self.client.copy_object(Bucket=self.bucket, Key=self.key(target_relative), CopySource={"Bucket": self.bucket, "Key": self.key(source_relative)})
@@ -309,6 +322,13 @@ class OSSStorage:
             return True
         except oss2.exceptions.NoSuchKey:
             return False
+
+    def list_relative(self, relative_prefix: str) -> List[str]:
+        if not self.enabled:
+            return []
+        prefix = self.key(relative_prefix.rstrip("/") + "/")
+        return [item.key[len(prefix):] for item in oss2.ObjectIterator(self.client, prefix=prefix)
+                if item.key != prefix and not item.key.endswith("/")]
 
     def put_tree(self, local_root: Path, remote_root: str) -> None:
         if not self.enabled:
@@ -1233,6 +1253,7 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                     <button id="importButton" class="import-button" type="button" onclick="document.getElementById('datasetFolderInput').click()">导入文件夹</button>
+                    <button id="ossBulkButton" class="import-button" type="button" onclick="openOssBulkDialog()">OSS 批量上传</button>
                     <button id="localPathButton" class="import-button" type="button" onclick="openLocalPathDialog()">本地路径导入</button>
                     <button id="exportButton" class="export-button" type="button" onclick="exportFinalDataset()">导出最终数据集</button>
                     <input id="datasetFolderInput" type="file" webkitdirectory directory multiple hidden onchange="importDatasetFolder(event)">
@@ -1255,6 +1276,19 @@ HTML_TEMPLATE = """
                     <button type="button" onclick="closeLocalPathDialog()" style="background:#64748b;">取消</button>
                     <button id="localPathImportButton" type="button" onclick="importLocalDataset()">开始导入</button>
                 </div>
+            </div>
+        </div>
+        <div id="ossBulkDialog" style="display:none; position:fixed; inset:0; z-index:1100; background:rgba(0,0,0,.45); align-items:center; justify-content:center;">
+            <div style="width:min(720px, calc(100vw - 36px)); padding:22px; border-radius:9px; background:#fff; box-shadow:0 12px 32px rgba(0,0,0,.28);">
+                <h3 style="margin:0 0 8px;">OSS 批量上传（推荐 4GB 以上数据）</h3>
+                <p style="margin:0 0 12px; color:#52606d; font-size:13px; line-height:1.5;">在存有原始数据的电脑安装 ossutil 2.0。先创建批次，复制命令并在该电脑执行；中断后执行同一条命令即可断点续传。上传完成后回到这里登记并载入。</p>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;"><button type="button" onclick="createOssBulkBatch()">1. 创建批次</button><span id="ossBulkState" style="font-size:13px; color:#52606d;"></span></div>
+                <label style="font-size:13px; display:block; margin-bottom:5px;">本地数据集目录（用于生成命令）</label>
+                <input id="ossBulkLocalPath" type="text" placeholder="例如：E:\\data\\test_input" oninput="renderOssBulkCommand()" style="width:100%; margin-bottom:9px;">
+                <label style="font-size:13px; display:block; margin-bottom:5px;">上传命令</label>
+                <textarea id="ossBulkCommand" readonly rows="4" style="width:100%; font-family:Consolas, monospace; font-size:12px; margin-bottom:9px;"></textarea>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:14px;"><button type="button" onclick="copyOssBulkCommand()">复制命令</button><input id="ossBulkUploadId" type="text" placeholder="批次标识" style="flex:1;"><button id="ossBulkRegisterButton" type="button" onclick="registerOssBulkBatch()">2. 登记并载入</button></div>
+                <div style="display:flex; justify-content:flex-end;"><button type="button" onclick="closeOssBulkDialog()" style="background:#64748b;">关闭</button></div>
             </div>
         </div>
         
@@ -1422,6 +1456,82 @@ HTML_TEMPLATE = """
 
         function closeLocalPathDialog() {
             document.getElementById('localPathDialog').style.display = 'none';
+        }
+
+        let ossBulkInfo = null;
+
+        function openOssBulkDialog() {
+            document.getElementById('ossBulkDialog').style.display = 'flex';
+        }
+
+        function closeOssBulkDialog() {
+            document.getElementById('ossBulkDialog').style.display = 'none';
+        }
+
+        function renderOssBulkCommand() {
+            const output = document.getElementById('ossBulkCommand');
+            if (!ossBulkInfo) {
+                output.value = '请先点击“创建批次”。';
+                return;
+            }
+            const localPath = document.getElementById('ossBulkLocalPath').value.trim() || 'E:\\data\\your_dataset';
+            const checkpoint = localPath.replace(/[\\/]+$/, '') + '\\ossutil-checkpoint';
+            output.value = `ossutil cp -r -f -u "${localPath}" "${ossBulkInfo.destination}" --checkpoint-dir "${checkpoint}" -j 10 --parallel 10`;
+        }
+
+        async function createOssBulkBatch() {
+            const state = document.getElementById('ossBulkState');
+            state.textContent = '正在创建…';
+            try {
+                const response = await fetch('/api/oss_bulk/create', { method: 'POST' });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || '创建批次失败');
+                ossBulkInfo = data;
+                document.getElementById('ossBulkUploadId').value = data.upload_id;
+                state.textContent = `已创建：${data.upload_id}`;
+                renderOssBulkCommand();
+            } catch (error) {
+                state.textContent = '创建失败：' + error.message;
+            }
+        }
+
+        async function copyOssBulkCommand() {
+            const command = document.getElementById('ossBulkCommand').value;
+            if (!command || command.startsWith('请先')) return;
+            try {
+                await navigator.clipboard.writeText(command);
+                document.getElementById('ossBulkState').textContent = '命令已复制。请在源电脑的终端执行。';
+            } catch (_) {
+                document.getElementById('ossBulkCommand').select();
+                document.execCommand('copy');
+            }
+        }
+
+        async function registerOssBulkBatch() {
+            const uploadId = document.getElementById('ossBulkUploadId').value.trim();
+            const button = document.getElementById('ossBulkRegisterButton');
+            if (!uploadId) return;
+            button.disabled = true;
+            try {
+                const registerResponse = await fetch('/api/oss_bulk/register', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
+                });
+                const registered = await registerResponse.json();
+                if (!registerResponse.ok || !registered.success) throw new Error(registered.error || '登记失败');
+                const completeResponse = await fetch('/api/direct_upload/complete', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
+                });
+                const completed = await completeResponse.json();
+                if (!completeResponse.ok || !completed.success) throw new Error(completed.error || '校验或载入失败');
+                resetDatasetUi();
+                await updateImageList();
+                closeOssBulkDialog();
+                showStatus('bboxStatus', `已登记并载入 ${completed.dataset_name}，共 ${completed.total} 张图片`, 'success');
+            } catch (error) {
+                document.getElementById('ossBulkState').textContent = '登记失败：' + error.message;
+            } finally {
+                button.disabled = false;
+            }
         }
 
         function resetDatasetUi() {
@@ -2839,6 +2949,8 @@ HTML_TEMPLATE = """
             if (runtime.cloud_storage) {
                 document.getElementById('localPathButton').style.display = 'none';
                 document.getElementById('infoDiv').textContent = 'Cloud mode: upload a dataset folder. Data is persisted to object storage; local computer paths are unavailable.';
+            } else {
+                document.getElementById('ossBulkButton').style.display = 'none';
             }
         }).catch(() => {});
         updateImageList();
@@ -3038,6 +3150,47 @@ def _find_imported_dataset_root(destination: Path) -> Optional[Path]:
 def _direct_upload_ttl() -> int:
     """Keep large-batch browser upload URLs usable for a realistic session."""
     return max(3600, min(int(os.environ.get("DIRECT_UPLOAD_URL_TTL", "21600")), 86400))
+
+
+def _valid_direct_upload_id(upload_id: str) -> bool:
+    suffix = upload_id[len("direct_"):] if upload_id.startswith("direct_") else ""
+    return len(suffix) == 32 and all(ch in "0123456789abcdef" for ch in suffix)
+
+
+@app.route("/api/oss_bulk/create", methods=["POST"])
+def api_oss_bulk_create():
+    """Create a unique OSS prefix for an operator using ossutil locally."""
+    if not isinstance(R2, OSSStorage) or not R2.enabled:
+        return jsonify({"success": False, "error": "OSS 批量上传仅在已配置阿里云 OSS 时可用。"}), 400
+    upload_id = "direct_" + uuid.uuid4().hex
+    relative = f"datasets/{upload_id}"
+    return jsonify({
+        "success": True,
+        "upload_id": upload_id,
+        "bucket": R2.bucket_name,
+        "object_prefix": R2.key(relative) + "/",
+        "destination": f"oss://{R2.bucket_name}/{R2.key(relative)}/",
+    })
+
+
+@app.route("/api/oss_bulk/register", methods=["POST"])
+def api_oss_bulk_register():
+    """Build the app manifest for files uploaded outside the browser."""
+    if not R2.enabled:
+        return jsonify({"success": False, "error": "对象存储尚未配置。"}), 400
+    upload_id = str((request.get_json(silent=True) or {}).get("upload_id") or "")
+    if not _valid_direct_upload_id(upload_id):
+        return jsonify({"success": False, "error": "批次标识无效。请使用网页生成的批次标识。"}), 400
+    try:
+        remote_root = f"datasets/{upload_id}"
+        files = sorted(name for name in R2.list_relative(remote_root) if name != ".upload_manifest.json")
+        if not files:
+            raise ValueError("该批次尚未发现上传文件。请确认 ossutil 的目标路径。")
+        manifest = {"files": files, "created_at": datetime.now(timezone.utc).isoformat(), "upload_method": "ossutil"}
+        R2.put_bytes(json.dumps(manifest, ensure_ascii=False).encode("utf-8"), f"{remote_root}/.upload_manifest.json")
+        return jsonify({"success": True, "upload_id": upload_id, "files": len(files)})
+    except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 400
 
 
 @app.route("/api/direct_upload/start", methods=["POST"])
