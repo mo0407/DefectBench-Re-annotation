@@ -585,7 +585,14 @@ def _load_bboxes_from_path(label_path: Path) -> List[Dict[str, Any]]:
             data = json.load(handle)
         items = data.get("bboxes") or data.get("detections") or data.get("annotations") or data.get("annotations_in_crop") or []
         xyxy_input = "annotations_in_crop" in data
-        return [item for index, raw in enumerate(items) if isinstance(raw, dict) and (item := _normalize_bbox(raw, index, bbox_is_xyxy=xyxy_input))]
+        normalized: List[Dict[str, Any]] = []
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                continue
+            item = _normalize_bbox(raw, index, bbox_is_xyxy=xyxy_input)
+            if item:
+                normalized.append(item)
+        return normalized
     except Exception as error:
         print(f"[Error] Failed to load annotations from {label_path}: {error}")
         return []
@@ -635,6 +642,61 @@ def _apply_direct_manifest_layout(dataset_root: Path) -> None:
         if any(name.startswith(prefix + folder + "/") for name in files):
             ALGORITHM_MASKS_DIR = dataset_root / folder
             break
+
+
+def _direct_manifest_file(stem: str, folders: Tuple[str, ...], *, mask: bool = False) -> Optional[str]:
+    """Find a sidecar object by the exact conventions used by the input batch."""
+    if not _active_dataset_manifest:
+        return None
+    root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+    prefix = root + "/" if root else ""
+    key = _sample_key(stem)
+    if mask:
+        expected = {f"{stem}_mask.png", f"{key}_mask.png", f"{stem}.png", f"{key}.png", f"{stem}_mask.jpg", f"{key}_mask.jpg"}
+    else:
+        expected = {f"{stem}.json", f"{key}.json", f"{key}_detection.json"}
+    for folder in folders:
+        folder_prefix = prefix + folder + "/"
+        for name in _active_dataset_manifest.get("files", []):
+            if name.startswith(folder_prefix) and Path(name).name in expected:
+                return name
+    return None
+
+
+def _direct_object_bytes(relative: Optional[str]) -> Optional[bytes]:
+    if not (relative and R2.enabled and _active_dataset_remote_root):
+        return None
+    return R2.get_bytes(f"{_active_dataset_remote_root}/{relative}")
+
+
+def _bboxes_from_bytes(payload: Optional[bytes]) -> List[Dict[str, Any]]:
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload.decode("utf-8"))
+        items = data.get("bboxes") or data.get("detections") or data.get("annotations") or data.get("annotations_in_crop") or []
+        xyxy_input = "annotations_in_crop" in data
+        normalized: List[Dict[str, Any]] = []
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                continue
+            item = _normalize_bbox(raw, index, bbox_is_xyxy=xyxy_input)
+            if item:
+                normalized.append(item)
+        return normalized
+    except Exception as error:
+        print(f"[Direct import] Failed to parse detection JSON: {error}")
+        return []
+
+
+def _mask_from_bytes(payload: Optional[bytes]) -> Optional[np.ndarray]:
+    if not payload:
+        return None
+    try:
+        return np.asarray(Image.open(io.BytesIO(payload)).convert("RGB"))
+    except Exception as error:
+        print(f"[Direct import] Failed to parse mask PNG: {error}")
+        return None
 
 
 def _load_image_list():
@@ -3029,9 +3091,26 @@ def api_image(index: int):
     img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
     image_data_url = f"data:image/jpeg;base64,{img_base64}"
     
-    # Load current expert bboxes and the immutable algorithm baseline.
-    bboxes = _load_bboxes_for_image(stem)
-    algorithm_bboxes = _load_bboxes_for_image(stem, baseline=True)
+    # For a browser-direct import the working cache is deliberately sparse.
+    # Read its two input sidecars from object storage by their manifest paths,
+    # rather than letting an empty cache directory make the annotation appear
+    # to be missing.  Local imports retain the normal file-based behaviour.
+    direct_mode = bool(_active_dataset_manifest and R2.enabled and _active_dataset_remote_root)
+    has_expert_version = False
+    if direct_mode:
+        algorithm_label_rel = _direct_manifest_file(stem, ("algorithm_labels", "detections", "labels"))
+        algorithm_label_payload = _direct_object_bytes(algorithm_label_rel)
+        algorithm_bboxes = _bboxes_from_bytes(algorithm_label_payload)
+
+        root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+        prefix = root + "/" if root else ""
+        expert_label_payload = _direct_object_bytes(f"{prefix}expert_labels/{stem}.json")
+        has_expert_version = expert_label_payload is not None
+        bboxes = _bboxes_from_bytes(expert_label_payload) if has_expert_version else algorithm_bboxes
+    else:
+        bboxes = _load_bboxes_for_image(stem)
+        algorithm_bboxes = _load_bboxes_for_image(stem, baseline=True)
+        has_expert_version = (EXPERT_LABELS_DIR / f"{stem}.json").exists() or bool(_mask_path(EXPERT_MASKS_DIR, stem))
     metadata_path = _metadata_path(stem)
     algorithm_metadata: Dict[str, Any] = {}
     if metadata_path:
@@ -3058,22 +3137,31 @@ def api_image(index: int):
             "score": bbox_data.get("score"),
         })
     
-    # Load mask
-    mask_data_url = None
-    mask_rgb = _load_mask_for_image(stem)
-    if mask_rgb is not None:
-        mask_pil = Image.fromarray(mask_rgb)
-        mask_buffer = io.BytesIO()
-        mask_pil.save(mask_buffer, format="PNG")
-        mask_base64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
-        mask_data_url = f"data:image/png;base64,{mask_base64}"
+    # Load mask.  As above, use direct object reads for a cloud-direct batch.
+    if direct_mode:
+        algorithm_mask_rel = _direct_manifest_file(stem, ("algorithm_masks", "masks"), mask=True)
+        algorithm_mask_rgb = _mask_from_bytes(_direct_object_bytes(algorithm_mask_rel))
+        expert_mask_rgb = _mask_from_bytes(_direct_object_bytes(f"{prefix}expert_masks/{stem}_mask.png"))
+        if expert_mask_rgb is not None:
+            mask_rgb = expert_mask_rgb
+            has_expert_version = True
+        else:
+            mask_rgb = algorithm_mask_rgb
+    else:
+        mask_rgb = _load_mask_for_image(stem)
+        algorithm_mask_rgb = _load_mask_for_image(stem, baseline=True)
 
-    algorithm_mask_data_url = None
-    algorithm_mask_rgb = _load_mask_for_image(stem, baseline=True)
+    mask_data_url = None
     # A direct import has no expert output initially.  Explicitly make the
     # algorithm data the displayed Mask instead of relying on a later UI step.
     if mask_rgb is None and algorithm_mask_rgb is not None:
         mask_rgb = algorithm_mask_rgb
+    if mask_rgb is not None:
+        mask_buffer = io.BytesIO()
+        Image.fromarray(mask_rgb).save(mask_buffer, format="PNG")
+        mask_data_url = "data:image/png;base64," + base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+
+    algorithm_mask_data_url = None
     if algorithm_mask_rgb is not None:
         algorithm_buffer = io.BytesIO()
         Image.fromarray(algorithm_mask_rgb).save(algorithm_buffer, format="PNG")
@@ -3090,8 +3178,8 @@ def api_image(index: int):
         "mask": mask_data_url,
         "algorithm_mask": algorithm_mask_data_url,
         "algorithm_metadata": algorithm_metadata,
-        "has_expert_version": (EXPERT_LABELS_DIR / f"{stem}.json").exists() or bool(_mask_path(EXPERT_MASKS_DIR, stem)),
-        "mask_source": "expert" if _mask_path(EXPERT_MASKS_DIR, stem) else "algorithm" if algorithm_mask_rgb is not None else None,
+        "has_expert_version": has_expert_version,
+        "mask_source": "expert" if has_expert_version and mask_rgb is not None else "algorithm" if algorithm_mask_rgb is not None else None,
     })
 
 
