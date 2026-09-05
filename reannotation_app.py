@@ -2855,7 +2855,12 @@ def api_direct_upload_complete():
             parts = PurePosixPath(name).parts
             if "images" in parts:
                 candidates.append("/".join(parts[:parts.index("images")]))
-        relative_root = next((root for root in sorted(set(candidates), key=len) if any(path.startswith((root + "/" if root else "") + "images/") for path in files) and any(path.startswith((root + "/" if root else "") + folder + "/") for folder in ("detections", "algorithm_labels", "labels")) and any(path.startswith((root + "/" if root else "") + folder + "/") for folder in ("masks", "algorithm_masks"))), None)
+        relative_root = next((root for root in sorted(set(candidates), key=len)
+            if any(item.startswith((root + "/" if root else "") + "images/") for item in files)
+            and any(any(item.startswith((root + "/" if root else "") + folder + "/") for item in files)
+                    for folder in ("detections", "algorithm_labels", "labels"))
+            and any(any(item.startswith((root + "/" if root else "") + folder + "/") for item in files)
+                    for folder in ("masks", "algorithm_masks"))), None)
         if relative_root is None:
             raise ValueError("未找到 images/、detections/（或 labels/）和 masks/ 子文件夹。")
         manifest["dataset_relative_root"] = relative_root
