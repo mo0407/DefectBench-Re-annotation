@@ -300,7 +300,10 @@ class OSSStorage:
             raise RuntimeError(
                 "OSS_BUCKET 已设置，但缺少 oss2 或 OSS_ENDPOINT、OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET。"
             )
-        self.client = oss2.Bucket(oss2.Auth(access_key, secret_key), endpoint, self.bucket_name)
+        self.client = oss2.Bucket(
+            oss2.Auth(access_key, secret_key), endpoint, self.bucket_name,
+            connect_timeout=float(os.environ.get("OSS_REQUEST_TIMEOUT_SECONDS", "20")),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -1565,12 +1568,16 @@ HTML_TEMPLATE = """
                 });
                 const registered = await parseApiJson(registerResponse);
                 if (!registerResponse.ok || !registered.success) throw new Error(registered.error || '登记失败');
-                setOssBulkState(`已发现 ${registered.files} 个文件，正在校验目录并激活数据集…`);
-                const completeResponse = await fetch('/api/direct_upload/complete', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload_id: uploadId })
-                });
-                const completed = await parseApiJson(completeResponse);
-                if (!completeResponse.ok || !completed.success) throw new Error(completed.error || '校验或载入失败');
+                let completed;
+                while (true) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    const response = await fetch('/api/oss_bulk/status/' + registered.job_id, {cache: 'no-store'});
+                    const job = await parseApiJson(response);
+                    if (!response.ok || !job.success) throw new Error(job.error || '无法读取登记进度');
+                    setOssBulkState(job.message || '正在登记…');
+                    if (job.state === 'failed') throw new Error(job.error);
+                    if (job.state === 'completed') { completed = job.result; break; }
+                }
                 resetDatasetUi();
                 await updateImageList();
                 setOssBulkState(`载入成功：${completed.total} 张图片。正在关闭窗口…`, 'success');
@@ -3224,6 +3231,40 @@ def api_oss_bulk_create():
     })
 
 
+_bulk_job_lock = threading.Lock()
+_bulk_job = {}
+
+
+def _run_bulk_registration(job_id, upload_id, files):
+    def update(**values):
+        with _bulk_job_lock:
+            _bulk_job.update(values)
+    try:
+        with app.app_context():
+            update(message=f"正在同步 {len(files)} 个文件的清单到 OSS…")
+            manifest = {"files": files, "created_at": datetime.now(timezone.utc).isoformat(), "upload_method": "ossutil"}
+            R2.put_bytes(json.dumps(manifest, ensure_ascii=False).encode("utf-8"), f"datasets/{upload_id}/.upload_manifest.json")
+            update(message="清单已保存，正在校验目录并载入批次…")
+            response = _complete_direct_upload(upload_id)
+            result = (response[0] if isinstance(response, tuple) else response).get_json()
+            if not result.get("success"):
+                raise ValueError(result.get("error", "载入失败"))
+            update(state="completed", message="登记并载入成功", result=result)
+    except Exception as error:
+        app.logger.exception("OSS bulk registration failed: %s", job_id)
+        update(state="failed", error=f"{type(error).__name__}: {error}", message="登记失败，可重试；无需重新上传图片。")
+
+
+@app.route("/api/oss_bulk/status/<job_id>")
+def api_oss_bulk_status(job_id):
+    with _bulk_job_lock:
+        if _bulk_job.get("job_id") != job_id:
+            return jsonify(success=False, error="登记任务已失效（服务可能已重启），请重新登记，无需重新上传图片。"), 404
+        response = jsonify(success=True, **_bulk_job)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 @app.route("/api/oss_bulk/register", methods=["POST"])
 def api_oss_bulk_register():
     """Build the app manifest for files uploaded outside the browser."""
@@ -3246,9 +3287,20 @@ def api_oss_bulk_register():
         files = sorted({_safe_upload_relative_path(name) for name in submitted_files})
         if not files:
             raise ValueError("该批次尚未发现上传文件。请确认 ossutil 的目标路径。")
-        manifest = {"files": files, "created_at": datetime.now(timezone.utc).isoformat(), "upload_method": "ossutil"}
-        R2.put_bytes(json.dumps(manifest, ensure_ascii=False).encode("utf-8"), f"{remote_root}/.upload_manifest.json")
-        return jsonify({"success": True, "upload_id": upload_id, "files": len(files)})
+        with _bulk_job_lock:
+            if _bulk_job.get("state") == "running":
+                if _bulk_job.get("upload_id") == upload_id:
+                    return jsonify(success=True, job_id=_bulk_job["job_id"]), 202
+                return jsonify(success=False, error="已有批次正在登记，请等待完成。"), 409
+            job_id = uuid.uuid4().hex
+            _bulk_job.clear()
+            _bulk_job.update(job_id=job_id, upload_id=upload_id, state="running", message="登记任务已开始")
+            try:
+                threading.Thread(target=_run_bulk_registration, args=(job_id, upload_id, files), daemon=True).start()
+            except Exception:
+                _bulk_job.update(state="failed")
+                raise
+        return jsonify(success=True, job_id=job_id, files=len(files)), 202
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 400
 
@@ -3344,6 +3396,10 @@ def api_direct_upload_complete():
     if not R2.enabled:
         return jsonify({"success": False, "error": "直传需要先配置 OSS 或 Cloudflare R2。"}), 400
     upload_id = str((request.get_json(silent=True) or {}).get("upload_id") or "")
+    return _complete_direct_upload(upload_id)
+
+
+def _complete_direct_upload(upload_id):
     suffix = upload_id[len("direct_"):] if upload_id.startswith("direct_") else ""
     if len(suffix) != 32 or not all(ch in "0123456789abcdef" for ch in suffix):
         return jsonify({"success": False, "error": "上传批次标识无效。"}), 400
