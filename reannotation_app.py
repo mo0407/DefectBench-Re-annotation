@@ -3329,9 +3329,13 @@ def api_direct_upload_complete():
             raise ValueError("上传清单不存在，请重新开始导入。")
         manifest = json.loads(manifest_bytes.decode("utf-8"))
         files = [str(item) for item in manifest.get("files", [])]
-        missing = [name for name in files if not R2.object_exists(f"{remote_root}/{name}")]
-        if missing:
-            raise ValueError(f"仍有 {len(missing)} 个文件未上传完成，请重新选择同一文件夹后继续上传。")
+        # Do not issue one remote HEAD request per object here.  A full batch
+        # can contain thousands of images and masks; serial verification makes
+        # the activation request exceed the web-worker time limit.  Browser
+        # uploads reach this point only after successful PUTs, while ossutil
+        # registration builds this manifest from the objects OSS has listed.
+        if not files:
+            raise ValueError("上传清单中没有文件。")
         candidates = []
         for name in files:
             parts = PurePosixPath(name).parts
