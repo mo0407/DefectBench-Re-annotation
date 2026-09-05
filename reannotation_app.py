@@ -26,6 +26,7 @@ import numpy as np
 import sys
 import uuid
 import threading
+import time
 from pathlib import Path, PurePosixPath
 
 # defect_bench path resolution
@@ -220,6 +221,13 @@ class R2Storage:
             HttpMethod="PUT",
         )
 
+    def presign_get(self, relative: str, *, expires_in: int = 3600) -> str:
+        if not self.enabled:
+            raise RuntimeError("对象存储尚未配置。")
+        return self.client.generate_presigned_url(
+            "get_object", Params={"Bucket": self.bucket, "Key": self.key(relative)}, ExpiresIn=expires_in
+        )
+
     def ensure_browser_upload_cors(self) -> None:
         """Allow direct PUT uploads only from the configured annotation site."""
         if not self.enabled:
@@ -328,10 +336,21 @@ class OSSStorage:
         headers = {"Content-Type": content_type} if content_type else None
         return self.client.sign_url("PUT", self.key(relative), expires_in, headers=headers)
 
+    def presign_get(self, relative: str, *, expires_in: int = 3600) -> str:
+        """Short-lived browser GET URL for direct image and mask display."""
+        if not self.enabled:
+            raise RuntimeError("对象存储尚未配置。")
+        return self.client.sign_url("GET", self.key(relative), expires_in)
+
 
 # OSS takes precedence for Alibaba Cloud deployments.  The R2 fallback keeps
 # the already deployed Render service usable until the OSS migration is live.
 R2 = OSSStorage() if os.environ.get("OSS_BUCKET", "").strip() else R2Storage()
+# Enabled only after the bucket CORS rule allows GET from the web application's
+# origin.  Keeping this explicit prevents a CORS misconfiguration from making
+# images disappear in the canvas.
+DIRECT_BROWSER_MEDIA = os.environ.get("OSS_BROWSER_DIRECT_READ", "false").strip().lower() in {"1", "true", "yes"}
+_direct_url_cache: Dict[str, Tuple[float, str]] = {}
 ACTIVE_DATASET_DESCRIPTOR = "app_state/active_dataset.json"
 _active_dataset_remote_root: Optional[str] = None
 _active_dataset_local_import_root: Optional[Path] = None
@@ -667,6 +686,26 @@ def _direct_object_bytes(relative: Optional[str]) -> Optional[bytes]:
     if not (relative and R2.enabled and _active_dataset_remote_root):
         return None
     return R2.get_bytes(f"{_active_dataset_remote_root}/{relative}")
+
+
+def _direct_browser_url(relative: Optional[str]) -> Optional[str]:
+    """Presign an OSS/R2 object for the browser when direct media is enabled."""
+    if not (DIRECT_BROWSER_MEDIA and relative and R2.enabled and _active_dataset_remote_root):
+        return None
+    try:
+        object_path = f"{_active_dataset_remote_root}/{relative}"
+        cached = _direct_url_cache.get(object_path)
+        now = time.monotonic()
+        if cached and cached[0] > now:
+            return cached[1]
+        url = R2.presign_get(object_path, expires_in=3600)
+        # Reuse the exact URL for five minutes so browser preloading also
+        # benefits the request that follows it.
+        _direct_url_cache[object_path] = (now + 300, url)
+        return url
+    except Exception as error:
+        print(f"[Direct media] Failed to sign GET URL: {error}")
+        return None
 
 
 def _bboxes_from_bytes(payload: Optional[bytes]) -> List[Dict[str, Any]]:
@@ -1651,7 +1690,7 @@ HTML_TEMPLATE = """
                             maskCtx2.drawImage(maskImg, 0, 0, img.width, img.height);
                             resolve();
                         };
-                        img.src = currentImageData.image;
+                        setCanvasImageSource(img, currentImageData.image);
                     });
                     originalMask = await cloneImage(maskImg);
                 } else {
@@ -1674,7 +1713,7 @@ HTML_TEMPLATE = """
                 
                 showStatus('bboxStatus', 'Image loaded successfully', 'success');
                 showStatus('maskStatus', 'Image loaded successfully', 'success');
-                prefetchNextImage(index, data.total);
+                prefetchNextImage(data.next_image);
                 
             } catch (error) {
                 console.error('Failed to load image:', error);
@@ -1735,21 +1774,37 @@ HTML_TEMPLATE = """
                 const img = new Image();
                 img.onload = () => resolve(img);
                 img.onerror = () => reject(new Error('Image or mask request failed'));
-                img.src = base64Str;
+                setCanvasImageSource(img, base64Str);
+            });
+        }
+
+        function setCanvasImageSource(img, source) {
+            // Direct OSS URLs are cross-origin.  CORS + this flag keep the
+            // image usable by the canvases and by mask export.
+            if (/^https?:\/\//i.test(source)) img.crossOrigin = 'anonymous';
+            img.src = source;
+        }
+
+        async function imageDataForApi() {
+            const source = currentImageData && currentImageData.image;
+            if (!source || source.startsWith('data:')) return source;
+            const response = await fetch(source);
+            if (!response.ok) throw new Error('Failed to fetch source image');
+            const blob = await response.blob();
+            return await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('Failed to encode source image'));
+                reader.readAsDataURL(blob);
             });
         }
 
         // Warm the browser cache for the next original image.  This only
         // applies to cloud URLs; data URLs and local mode remain unchanged.
-        function prefetchNextImage(index, total) {
-            const nextIndex = index + 1;
-            if (nextIndex >= total) return;
-            const params = new URLSearchParams();
-            if (currentDataset) params.append('dataset', currentDataset);
-            if (currentPrimaryClass) params.append('primary_class', currentPrimaryClass);
-            const query = params.toString();
+        function prefetchNextImage(source) {
+            if (!source) return;
             const image = new Image();
-            image.src = `/api/media/${nextIndex}/image${query ? '?' + query : ''}`;
+            setCanvasImageSource(image, source);
         }
         
         // Clone Image object
@@ -1898,7 +1953,7 @@ HTML_TEMPLATE = """
                     bboxCtx.fillText(labelText, x + adjustedLabelPadding, y - adjustedLabelPadding);
                 }
             };
-            img.src = currentImageData.image;
+            setCanvasImageSource(img, currentImageData.image);
         }
         
         // Get mouse coordinates in original image
@@ -1963,7 +2018,7 @@ HTML_TEMPLATE = """
                     maskCtx.stroke();
                 });
             };
-            img.src = currentImageData.image;
+            setCanvasImageSource(img, currentImageData.image);
         }
         
         // BBox mode setting
@@ -2146,6 +2201,7 @@ HTML_TEMPLATE = """
             }
             showStatus('maskStatus', 'Executing SAM refine...', '');
             try {
+                const sourceImageData = await imageDataForApi();
                 const points = maskPoints.map(p => [Math.round(p.x), Math.round(p.y)]);
                 const labels = maskPoints.map(p => p.label);
                 const bboxes = currentBBoxes.map(b => {
@@ -2156,7 +2212,7 @@ HTML_TEMPLATE = """
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        image_data: currentImageData.image,
+                        image_data: sourceImageData,
                         mask_data: currentMask ? currentMask.toDataURL() : null,
                         points: points,
                         labels: labels,
@@ -2299,7 +2355,7 @@ HTML_TEMPLATE = """
                     const maskCtx2 = currentMask.getContext('2d');
                     applyBrushOperation(maskCtx2, brushImg, img.width, img.height);
                 };
-                img.src = currentImageData.image;
+                setCanvasImageSource(img, currentImageData.image);
             };
             brushImg.src = brushDataURL;
         }
@@ -2583,11 +2639,12 @@ HTML_TEMPLATE = """
             const model = document.getElementById('detectionModelSelect').value;
             showStatus('bboxStatus', 'Running detection...', '');
             try {
+                const sourceImageData = await imageDataForApi();
                 const response = await fetch('/api/detect', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        image_data: currentImageData.image,
+                        image_data: sourceImageData,
                         model: model,
                         filename: currentImageData.filename || 'unknown.jpg'
                     })
@@ -3151,7 +3208,13 @@ def api_image(index: int):
     if direct_mode:
         # The browser makes independent requests for media.  The annotation
         # response is consequently small and box editing can start at once.
-        image_data_url = f"/api/media/{index}/image{media_query}"
+        root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+        prefix = root + "/" if root else ""
+        image_data_url = _direct_browser_url(f"{prefix}images/{img_info['name']}") or f"/api/media/{index}/image{media_query}"
+        next_image_url = (
+            _direct_browser_url(f"{prefix}images/{filtered[index + 1]['name']}")
+            if index + 1 < len(filtered) else None
+        )
     else:
         img = Image.open(img_path)
         img_rgb = img.convert("RGB")
@@ -3159,6 +3222,7 @@ def api_image(index: int):
         img_rgb.save(buffer, format="JPEG")
         img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
         image_data_url = f"data:image/jpeg;base64,{img_base64}"
+        next_image_url = None
     
     # For a browser-direct import the working cache is deliberately sparse.
     # Read its two input sidecars from object storage by their manifest paths,
@@ -3170,8 +3234,6 @@ def api_image(index: int):
         algorithm_label_payload = _direct_object_bytes(algorithm_label_rel)
         algorithm_bboxes = _bboxes_from_bytes(algorithm_label_payload)
 
-        root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
-        prefix = root + "/" if root else ""
         expert_label_payload = _direct_object_bytes(f"{prefix}expert_labels/{stem}.json")
         has_expert_version = expert_label_payload is not None
         bboxes = _bboxes_from_bytes(expert_label_payload) if has_expert_version else algorithm_bboxes
@@ -3209,8 +3271,13 @@ def api_image(index: int):
     # and Base64-encoding a potentially large PNG inside the web worker.
     if direct_mode:
         algorithm_mask_rel = _direct_manifest_file(stem, ("algorithm_masks", "masks"), mask=True)
-        mask_data_url = f"/api/media/{index}/mask{media_query}" if algorithm_mask_rel else None
-        algorithm_mask_data_url = f"/api/media/{index}/algorithm_mask{media_query}" if algorithm_mask_rel else None
+        algorithm_mask_data_url = _direct_browser_url(algorithm_mask_rel) if algorithm_mask_rel else None
+        if algorithm_mask_data_url is None and algorithm_mask_rel:
+            algorithm_mask_data_url = f"/api/media/{index}/algorithm_mask{media_query}"
+        preferred_mask_rel = f"{prefix}expert_masks/{stem}_mask.png" if has_expert_version else algorithm_mask_rel
+        mask_data_url = _direct_browser_url(preferred_mask_rel) if preferred_mask_rel else None
+        if mask_data_url is None and algorithm_mask_rel:
+            mask_data_url = f"/api/media/{index}/mask{media_query}"
         mask_rgb = None
         algorithm_mask_rgb = None
     else:
@@ -3235,6 +3302,7 @@ def api_image(index: int):
         "total": len(filtered),
         "filename": img_info['name'],
         "image": image_data_url,
+        "next_image": next_image_url,
         "bboxes": bbox_list,
         "algorithm_bboxes": algorithm_bbox_list,
         "mask": mask_data_url,
