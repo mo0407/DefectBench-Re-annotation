@@ -3238,7 +3238,9 @@ def api_oss_bulk_register():
         submitted_files = data.get("files")
         if not isinstance(submitted_files, list) or not submitted_files:
             raise ValueError("请选择源电脑上已上传的同一数据文件夹，以提供文件清单。")
-        max_files = int(os.environ.get("DIRECT_UPLOAD_MAX_FILES", "20000"))
+        # This request carries only relative path strings, not file contents.
+        # Keep its ceiling independent from browser-direct PUT uploads.
+        max_files = int(os.environ.get("OSS_BULK_MANIFEST_MAX_FILES", "100000"))
         if len(submitted_files) > max_files:
             raise ValueError(f"文件数超过上限 {max_files}。")
         files = sorted({_safe_upload_relative_path(name) for name in submitted_files})
