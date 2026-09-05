@@ -435,6 +435,7 @@ def _ensure_active_dataset_loaded() -> None:
             for folder in ("images", "labels", "detections", "algorithm_labels", "masks", "algorithm_masks", "metadata", "expert_labels", "expert_masks", "revisions"):
                 (dataset_root / folder).mkdir(parents=True, exist_ok=True)
             _configure_dataset_root(dataset_root)
+            _apply_direct_manifest_layout(dataset_root)
             _active_dataset_remote_root = remote_root
             _active_dataset_local_import_root = cache_root
             _active_dataset_manifest = descriptor.get("manifest") or {}
@@ -612,6 +613,28 @@ def _materialize_sample(stem: str) -> None:
         local = _active_dataset_local_import_root / PurePosixPath(name)
         if not local.exists():
             R2.get_file(f"{_active_dataset_remote_root}/{name}", local)
+
+
+def _apply_direct_manifest_layout(dataset_root: Path) -> None:
+    """Use the input folders that actually exist in a direct-upload manifest.
+
+    The local cache creates empty compatibility folders.  They must not shadow
+    an uploaded ``detections/`` or ``masks/`` directory.
+    """
+    global ALGORITHM_LABELS_DIR, ALGORITHM_MASKS_DIR
+    if not _active_dataset_manifest:
+        return
+    root = str(_active_dataset_manifest.get("dataset_relative_root") or "").strip("/")
+    prefix = root + "/" if root else ""
+    files = _active_dataset_manifest.get("files", [])
+    for folder in ("algorithm_labels", "detections", "labels"):
+        if any(name.startswith(prefix + folder + "/") for name in files):
+            ALGORITHM_LABELS_DIR = dataset_root / folder
+            break
+    for folder in ("algorithm_masks", "masks"):
+        if any(name.startswith(prefix + folder + "/") for name in files):
+            ALGORITHM_MASKS_DIR = dataset_root / folder
+            break
 
 
 def _load_image_list():
@@ -2874,6 +2897,7 @@ def api_direct_upload_complete():
         _active_dataset_local_import_root = destination
         _active_dataset_manifest = manifest
         _configure_dataset_root(dataset_root)
+        _apply_direct_manifest_layout(dataset_root)
         _load_image_list()
         if not _image_list_cache:
             raise ValueError("images/ 子文件夹中没有可读取的 JPG 或 PNG 图片。")
