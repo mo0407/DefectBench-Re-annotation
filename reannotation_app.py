@@ -209,7 +209,7 @@ class R2Storage:
         """Server-side R2 copy, so export files never occupy Render disk."""
         self.client.copy_object(Bucket=self.bucket, Key=self.key(target_relative), CopySource={"Bucket": self.bucket, "Key": self.key(source_relative)})
 
-    def presign_put(self, relative: str, *, expires_in: int = 3600) -> str:
+    def presign_put(self, relative: str, *, expires_in: int = 3600, content_type: str = "") -> str:
         """Create a short-lived browser upload URL without exposing R2 credentials."""
         if not self.enabled:
             raise RuntimeError("对象存储尚未配置。")
@@ -319,11 +319,14 @@ class OSSStorage:
         """Copy server-side inside OSS; never write complete exports to Render disk."""
         self.client.copy_object(self.key(target_relative), self.bucket_name, self.key(source_relative))
 
-    def presign_put(self, relative: str, *, expires_in: int = 3600) -> str:
+    def presign_put(self, relative: str, *, expires_in: int = 3600, content_type: str = "") -> str:
         """Short-lived browser PUT URL.  The browser sends images direct to OSS."""
         if not self.enabled:
             raise RuntimeError("对象存储尚未配置。")
-        return self.client.sign_url("PUT", self.key(relative), expires_in)
+        # OSS includes Content-Type in a V1 signed URL.  It must exactly match
+        # the browser PUT header, otherwise OSS returns SignatureDoesNotMatch.
+        headers = {"Content-Type": content_type} if content_type else None
+        return self.client.sign_url("PUT", self.key(relative), expires_in, headers=headers)
 
 
 # OSS takes precedence for Alibaba Cloud deployments.  The R2 fallback keeps
@@ -1373,7 +1376,8 @@ HTML_TEMPLATE = """
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ files: files.map(file => ({
                     path: file.webkitRelativePath || file.name,
-                    size: file.size
+                    size: file.size,
+                    content_type: file.type || ''
                 })) })
             });
             const start = await startResponse.json();
@@ -1397,8 +1401,10 @@ HTML_TEMPLATE = """
                     // the operator to restart a complete batch.
                     for (let attempt = 1; attempt <= 3; attempt++) {
                         try {
+                            const contentType = files[index].type || '';
                             putResponse = await fetch(start.uploads[index].url, {
-                                method: 'PUT', body: files[index]
+                                method: 'PUT', body: files[index],
+                                headers: contentType ? { 'Content-Type': contentType } : undefined
                             });
                             if (putResponse.ok) break;
                             const body = (await putResponse.text()).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -2817,8 +2823,9 @@ def api_direct_upload_start():
             seen.add(relative_name)
             if int(entry.get("size") or 0) < 0:
                 raise ValueError("文件大小无效。")
+            content_type = str(entry.get("content_type") or "").strip()[:200]
             remote_relative = f"datasets/{import_id}/{relative_name}"
-            uploads.append({"path": relative_name, "url": R2.presign_put(remote_relative)})
+            uploads.append({"path": relative_name, "url": R2.presign_put(remote_relative, content_type=content_type)})
         # Persist the file list before the browser begins uploading.  Completion
         # can now validate and open the batch without listing/downloading 3.8GB.
         manifest = {"files": sorted(seen), "created_at": datetime.now(timezone.utc).isoformat()}
